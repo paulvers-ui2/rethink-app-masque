@@ -381,6 +381,8 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
      * [hard] restarts a process that is alive but carries no traffic; a plain start
      * would keep it.
      */
+    // The early returns are the "nothing to do" exits: WARP was switched off meanwhile.
+    @Suppress("ReturnCount")
     private suspend fun recoverUsque(reason: String, hard: Boolean) {
         if (!usqueRecoverLock.tryLock()) return // a recovery is already running
         try {
@@ -419,28 +421,27 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
             var failures = 0
             while (true) {
                 kotlinx.coroutines.delay(USQUE_WATCHDOG_INTERVAL_MS)
-                if (!simpleWarpActive()) {
-                    failures = 0
-                    continue
-                }
-                armUsqueDozeAlarmIfStale()
-                if (!UsqueManager.isRunning()) {
-                    failures = 0
-                    recoverUsque("watchdog: process not running", hard = false)
-                    continue
-                }
-                if (UsqueManager.probeUsqueLiveness()) {
-                    failures = 0
-                    continue
-                }
-                // usque rebuilds a dead tunnel by itself within seconds (network switch,
-                // stalled path); restart the process only if two checks in a row fail.
-                failures++
-                if (failures >= USQUE_WATCHDOG_MAX_FAILURES) {
-                    failures = 0
-                    recoverUsque("watchdog: no traffic through WARP", hard = true)
-                }
+                failures = if (simpleWarpActive()) usqueWatchdogRound(failures) else 0
             }
+        }
+    }
+
+    // One watchdog round; returns how many probes in a row have failed so far.
+    private suspend fun usqueWatchdogRound(failures: Int): Int {
+        armUsqueDozeAlarmIfStale()
+        return when {
+            !UsqueManager.isRunning() -> {
+                recoverUsque("watchdog: process not running", hard = false)
+                0
+            }
+            UsqueManager.probeUsqueLiveness() -> 0
+            // usque rebuilds a dead tunnel by itself within seconds (network switch,
+            // stalled path); restart the process only if two checks in a row fail.
+            failures + 1 >= USQUE_WATCHDOG_MAX_FAILURES -> {
+                recoverUsque("watchdog: no traffic through WARP", hard = true)
+                0
+            }
+            else -> failures + 1
         }
     }
 
@@ -487,26 +488,28 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
             var failures = 0
             while (true) {
                 kotlinx.coroutines.delay(CHAIN_WATCHDOG_INTERVAL_MS)
-                if (!persistentState.chainEnabled) {
-                    failures = 0
-                    continue
-                }
-                if (!ChainManager.isRunning()) {
-                    // A dead process needs no second opinion.
-                    failures = 0
-                    restartChain("watchdog: chain process not running")
-                    continue
-                }
-                val healthy = ChainManager.probeChainLiveness()
-                // Traffic flows again: the next outage starts from the shortest wait.
-                if (healthy) chainRestartBackoffMs = CHAIN_RESTART_MIN_INTERVAL_MS
-                failures = if (healthy) 0 else failures + 1
-                if (failures >= CHAIN_WATCHDOG_MAX_FAILURES) {
-                    failures = 0
-                    restartChain("watchdog: $CHAIN_WATCHDOG_MAX_FAILURES failed probes")
-                }
+                failures = if (persistentState.chainEnabled) chainWatchdogRound(failures) else 0
             }
         }
+    }
+
+    // One watchdog round; returns how many probes in a row have failed so far.
+    private suspend fun chainWatchdogRound(failures: Int): Int = when {
+        // A dead process needs no second opinion.
+        !ChainManager.isRunning() -> {
+            restartChain("watchdog: chain process not running")
+            0
+        }
+        ChainManager.probeChainLiveness() -> {
+            // Traffic flows again: the next outage starts from the shortest wait.
+            chainRestartBackoffMs = CHAIN_RESTART_MIN_INTERVAL_MS
+            0
+        }
+        failures + 1 >= CHAIN_WATCHDOG_MAX_FAILURES -> {
+            restartChain("watchdog: $CHAIN_WATCHDOG_MAX_FAILURES failed probes")
+            0
+        }
+        else -> failures + 1
     }
 
     // The watchdog, the death callback, a network change and screen unlock can all ask for
@@ -2178,30 +2181,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
                 }
                 usqueDozeWakeLock = wl
 
-                io("usqueDozeCheck") {
-                    try {
-                        // probeUsqueLiveness() returns false on connection refused, which
-                        // is the correct dead-process signal.
-                        val running = UsqueManager.isRunning()
-                        if (!running || !UsqueManager.probeUsqueLiveness()) {
-                            recoverUsque("Doze watchdog: tunnel down (running=$running)", hard = running)
-                        }
-                    } finally {
-                        // Reschedule the next Doze alarm regardless (keeps the chain alive),
-                        // then release the wakelock -- in that order, so a failure in the
-                        // check above can never leave the chain unscheduled.
-                        if (simpleWarpActive()) {
-                            usqueDozeArmedAtMs = elapsedRealtime()
-                            scheduleUsqueDozeAlarm()
-                        }
-                        try {
-                            usqueDozeWakeLock?.let { if (it.isHeld) it.release() }
-                        } catch (e: Exception) {
-                            Logger.w(LOG_TAG_VPN, "usque: error releasing Doze wakelock: ${e.message}")
-                        }
-                        usqueDozeWakeLock = null
-                    }
-                }
+                io("usqueDozeCheck") { usqueDozeCheck() }
             }
         }
         // Android 13+ (API 33) requires RECEIVER_NOT_EXPORTED for non-system broadcast receivers.
@@ -2212,6 +2192,33 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
             android.content.IntentFilter(ACTION_USQUE_DOZE_WATCHDOG),
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
+    }
+
+    // The Doze alarm's check, run while usqueDozeWakeLock holds the device awake.
+    @Suppress("TooGenericExceptionCaught")
+    private suspend fun usqueDozeCheck() {
+        try {
+            // probeUsqueLiveness() returns false on connection refused, which
+            // is the correct dead-process signal.
+            val running = UsqueManager.isRunning()
+            if (!running || !UsqueManager.probeUsqueLiveness()) {
+                recoverUsque("Doze watchdog: tunnel down (running=$running)", hard = running)
+            }
+        } finally {
+            // Reschedule the next Doze alarm regardless (keeps the chain alive),
+            // then release the wakelock -- in that order, so a failure in the
+            // check above can never leave the chain unscheduled.
+            if (simpleWarpActive()) {
+                usqueDozeArmedAtMs = elapsedRealtime()
+                scheduleUsqueDozeAlarm()
+            }
+            try {
+                usqueDozeWakeLock?.let { if (it.isHeld) it.release() }
+            } catch (e: Exception) {
+                Logger.w(LOG_TAG_VPN, "usque: error releasing Doze wakelock: ${e.message}")
+            }
+            usqueDozeWakeLock = null
+        }
     }
 
     private fun registerUserPresentReceiver() {

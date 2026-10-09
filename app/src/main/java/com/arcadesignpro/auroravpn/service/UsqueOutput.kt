@@ -51,6 +51,7 @@ class UsqueOutput(private val capacity: Int = DEFAULT_CAPACITY) {
             "--connect-timeout" to true,
             "--probe-addr" to true,
             "--watch-network" to false,
+            "--secrets-stdin" to false,
         )
 
         /** [args] without the flags an older libusque.so does not know. */

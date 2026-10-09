@@ -32,8 +32,9 @@ import javax.crypto.spec.GCMParameterSpec
  * plain, as before, rather than leave the tunnel without keys.
  */
 // Every catch here sits on a Keystore / file boundary where a failure must turn into
-// "no keys" or "not saved", never a crash of the VPN service.
-@Suppress("TooGenericExceptionCaught")
+// "no keys" or "not saved", never a crash of the VPN service; the early returns are those
+// same failure exits. One flat object, like UsqueManager and ChainManager.
+@Suppress("TooGenericExceptionCaught", "TooManyFunctions", "ReturnCount")
 object KeyVault {
     private const val KEYSTORE = "AndroidKeyStore"
     private const val KEY_ALIAS = "auroravpn.tunnel-keys.v1"
