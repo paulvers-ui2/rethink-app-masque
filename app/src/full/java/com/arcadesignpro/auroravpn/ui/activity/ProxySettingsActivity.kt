@@ -75,6 +75,7 @@ import com.celzero.firestack.backend.Backend
 import com.celzero.firestack.backend.RouterStats
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -106,6 +107,10 @@ class ProxySettingsActivity : AppCompatActivity(R.layout.fragment_proxy_configur
         // after enabling WARP before trusting it in updateWarpUi() (see the io{} block below).
         private const val WARP_SETTLE_TIMEOUT_MS = 3000L
         private const val WARP_SETTLE_POLL_MS = 200L
+        // Turning WARP on tries this many starts, this far apart, before giving up: the
+        // first start right after boot or a network change can miss.
+        private const val WARP_START_ATTEMPTS = 3
+        private const val WARP_START_RETRY_MS = 1500L
     }
 
     private fun Context.isDarkThemeOn(): Boolean {
@@ -161,6 +166,7 @@ class ProxySettingsActivity : AppCompatActivity(R.layout.fragment_proxy_configur
             b.settingsActivityWarpSwitch.setOnCheckedChangeListener(null)
             b.settingsActivityWarpSwitch.isChecked = true   // intent = ON; do NOT show OFF while probing
             b.settingsActivityWarpSwitch.isEnabled = false
+            b.settingsActivityWarpDesc.text = getString(R.string.warp_status_connecting)
             isWarpStarting = true
             io {
                 // Fast port probe first (300ms timeout) — avoids unnecessary restart
@@ -587,54 +593,16 @@ class ProxySettingsActivity : AppCompatActivity(R.layout.fragment_proxy_configur
                 // disabled-state redraw that cuts off the native checked-state slide animation
                 // mid-flight, which is the other half of the "animation doesn't play" symptom.
                 b.settingsActivityWarpSwitch.post { b.settingsActivityWarpSwitch.isEnabled = false }
+                // Say what is happening instead of leaving the old status up (or a blank
+                // line) while usque starts, which can take a few seconds.
+                b.settingsActivityWarpDesc.text = getString(R.string.warp_status_connecting)
                 val warpProxyName = getString(R.string.warp_tunnel_title)
                 isWarpStarting = true
                 io {
-                    val chainWasOn = stopChainForWarp()
-                    val started = UsqueManager.startSocksProxy(this@ProxySettingsActivity)
-                    if (started) {
-                        // Set usqueEnabled = true BEFORE updateCustomSocks5Proxy so that any
-                        // reactive observer triggered by the DB write sees the correct flag.
-                        // Previously this was reversed, causing the observer to read
-                        // usqueEnabled=false and flip the switch back to OFF (double-tap bug).
-                        persistentState.usqueEnabled = true
-                        // Fresh WARP session: the auto-disable dot goes back to white
-                        // ("not triggered yet") until this session's own timer fires.
-                        persistentState.warpAutoDisableTriggeredAtMs = 0L
-                        VpnController.scheduleWarpAutoDisableIfEnabled()
-                        val warpProxy = ProxyEndpoint(
-                            WARP_PROXY_ID,
-                            warpProxyName,
-                            ProxyManager.ProxyMode.SOCKS5.value,
-                            ProxyEndpoint.DEFAULT_PROXY_TYPE,
-                            /* appName */ "",
-                            UsqueManager.SOCKS_HOST,
-                            UsqueManager.SOCKS_PORT,
-                            /* userName */ "",
-                            /* password */ "",
-                            isSelected = true,
-                            isCustom = true,
-                            isUDP = false,
-                            modifiedDataTime = 0L,
-                            latency = 0
-                        )
-                        appConfig.updateCustomSocks5Proxy(warpProxy)
-                        reapplyIfChainWasOn(chainWasOn)
-                        // Bug: on the very first enable, the switch flipped back to OFF even
-                        // though WARP genuinely connected a moment later - it also stayed wrong
-                        // until a second tap re-checked it. updateCustomSocks5Proxy() can trigger
-                        // BraveVPNService to rebuild the tunnel around the new proxy, which can
-                        // briefly cycle the usque process before things settle. Calling
-                        // updateWarpUi() immediately could land in that gap and read
-                        // isRunning()=false, then nothing re-checked it afterwards. Give it a
-                        // short window to settle and re-confirm before trusting it in the UI.
-                        var waitedMs = 0L
-                        while (!UsqueManager.isRunning() && waitedMs < WARP_SETTLE_TIMEOUT_MS) {
-                            delay(WARP_SETTLE_POLL_MS)
-                            waitedMs += WARP_SETTLE_POLL_MS
-                        }
-                    }
-                    dropChainRowIfWarpFailed(started, chainWasOn)
+                    // Finish the switch-over even if the user leaves the screen meanwhile:
+                    // cancelling halfway left usque running with WARP marked off, or the
+                    // tunnel pointed at a dead port.
+                    val started = withContext(NonCancellable) { switchWarpOn(warpProxyName) }
                     uiCtx {
                         isWarpStarting = false
                         if (started) {
@@ -642,11 +610,12 @@ class ProxySettingsActivity : AppCompatActivity(R.layout.fragment_proxy_configur
                         } else {
                             b.settingsActivityWarpSwitch.isChecked = false
                             b.settingsActivityWarpSwitch.isEnabled = true
-                            showToastUiCentered(
-                                this@ProxySettingsActivity,
-                                getString(R.string.warp_start_failed),
-                                Toast.LENGTH_SHORT
-                            )
+                            updateWarpUi()
+                            val reason = UsqueManager.lastStartError()
+                            val msg = if (reason.isEmpty()) getString(R.string.warp_start_failed)
+                                else getString(R.string.warp_start_failed_reason, reason)
+                            b.settingsActivityWarpDesc.text = msg
+                            showToastUiCentered(this@ProxySettingsActivity, msg, Toast.LENGTH_LONG)
                         }
                     }
                 }
@@ -658,6 +627,65 @@ class ProxySettingsActivity : AppCompatActivity(R.layout.fragment_proxy_configur
                 updateWarpUi()
             }
         }
+    }
+
+    /**
+     * Starts simple WARP (retrying a couple of times) and points the tunnel at it.
+     * Returns whether WARP is up.
+     */
+    private suspend fun switchWarpOn(warpProxyName: String): Boolean {
+        val chainWasOn = stopChainForWarp()
+        var started = false
+        for (attempt in 1..WARP_START_ATTEMPTS) {
+            started = UsqueManager.startSocksProxy(this@ProxySettingsActivity)
+            if (started || attempt == WARP_START_ATTEMPTS) break
+            Logger.w(LOG_TAG_PROXY, "usque: start attempt $attempt failed (${UsqueManager.lastStartError()}), retrying")
+            delay(WARP_START_RETRY_MS)
+        }
+        if (started) {
+            // Set usqueEnabled = true BEFORE updateCustomSocks5Proxy so that any
+            // reactive observer triggered by the DB write sees the correct flag.
+            // Previously this was reversed, causing the observer to read
+            // usqueEnabled=false and flip the switch back to OFF (double-tap bug).
+            persistentState.usqueEnabled = true
+            // Fresh WARP session: the auto-disable dot goes back to white
+            // ("not triggered yet") until this session's own timer fires.
+            persistentState.warpAutoDisableTriggeredAtMs = 0L
+            VpnController.scheduleWarpAutoDisableIfEnabled()
+            val warpProxy = ProxyEndpoint(
+                WARP_PROXY_ID,
+                warpProxyName,
+                ProxyManager.ProxyMode.SOCKS5.value,
+                ProxyEndpoint.DEFAULT_PROXY_TYPE,
+                /* appName */ "",
+                UsqueManager.SOCKS_HOST,
+                UsqueManager.SOCKS_PORT,
+                /* userName */ "",
+                /* password */ "",
+                isSelected = true,
+                isCustom = true,
+                isUDP = false,
+                modifiedDataTime = 0L,
+                latency = 0
+            )
+            appConfig.updateCustomSocks5Proxy(warpProxy)
+            reapplyIfChainWasOn(chainWasOn)
+            // Bug: on the very first enable, the switch flipped back to OFF even
+            // though WARP genuinely connected a moment later - it also stayed wrong
+            // until a second tap re-checked it. updateCustomSocks5Proxy() can trigger
+            // BraveVPNService to rebuild the tunnel around the new proxy, which can
+            // briefly cycle the usque process before things settle. Calling
+            // updateWarpUi() immediately could land in that gap and read
+            // isRunning()=false, then nothing re-checked it afterwards. Give it a
+            // short window to settle and re-confirm before trusting it in the UI.
+            var waitedMs = 0L
+            while (!UsqueManager.isRunning() && waitedMs < WARP_SETTLE_TIMEOUT_MS) {
+                delay(WARP_SETTLE_POLL_MS)
+                waitedMs += WARP_SETTLE_POLL_MS
+            }
+        }
+        dropChainRowIfWarpFailed(started, chainWasOn)
+        return started
     }
 
     /**
@@ -694,9 +722,7 @@ class ProxySettingsActivity : AppCompatActivity(R.layout.fragment_proxy_configur
             return
         }
         io {
-            UsqueManager.stopSocksProxy()
-            kotlinx.coroutines.delay(500)
-            val started = UsqueManager.startSocksProxy(this@ProxySettingsActivity)
+            val started = UsqueManager.restartSocksProxy(this@ProxySettingsActivity)
             uiCtx {
                 showToastUiCentered(
                     this@ProxySettingsActivity,

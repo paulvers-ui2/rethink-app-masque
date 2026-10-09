@@ -1,25 +1,29 @@
 package com.arcadesignpro.auroravpn.service
 
 import android.content.Context
-import java.io.File
 
 /**
  * Builds the `libusque.so chain` command line from the chain screen's per-hop
  * settings. The command is a fixed core plus one editable flag string per hop:
  *
  *   core   chain -b 127.0.0.1 -p 40001 -c {config} --wg {wg} --exit-config {exit_config}
- *   WARP1  -s {sni} -m 1280 -i 1350 -P 443 -k 30s -r 1s --http2-fallback-after 2
+ *   WARP1  -s {sni} -m 1280 -i 1350 -P 443 -k 10s -r 1s --idle-timeout 25s --stall-timeout 2s
+ *          --http2-fallback-after 2
  *   wg0    --wg-mtu 0 --wg-keepalive 25
  *   WARP2  --exit-sni {exit_sni} --exit-transport auto --exit-mtu 1280 --exit-connect-port 443
+ *          --exit-stall-timeout 8s
  *
  * The core is not editable: the VPN tunnel is routed to that SOCKS port (see
  * [ChainRouting]) and the three files are the ones the screen edits. The hop
  * defaults spell out the values usque uses anyway (only -s and -i are the app's
  * own choice, same as simple WARP), so the screen shows what really runs.
  *
- * Placeholders: {config} {wg} {exit_config} are the three file paths, {sni} and
+ * Placeholders: {config} {wg} {exit_config} are the three key files, {sni} and
  * {exit_sni} the per-hop SNIs. A flag whose placeholder is blank is dropped with
  * it, so a blank SNI falls back to usque's own default instead of breaking argv.
+ * The keys reach usque through stdin (ChainManager adds --secrets-stdin), so the
+ * file placeholders render as "-"; only an old libusque.so gets real paths
+ * ([buildWithFiles]).
  */
 // Small single-purpose helpers (defaults, validate, render, MTU math) on purpose.
 @Suppress("TooManyFunctions")
@@ -36,16 +40,22 @@ object ChainArgs {
     // WARP1 is the only hop on the host network (the ISP sees its SNI). QUIC with
     // 1350-byte packets like simple WARP; after 2 failed QUIC connects in a row it
     // switches to HTTP/2 over TCP 443 (mobile networks that drop UDP 443). -k / -r
-    // are the MASQUE keepalive and reconnect delay, shared with WARP2.
-    const val DEFAULT_WARP1_ARGS = "-s {sni} -m 1280 -i 1350 -P 443 -k 30s -r 1s --http2-fallback-after 2"
+    // are the MASQUE keepalive and reconnect delay, shared with WARP2. WARP1 is
+    // rebuilt at once when the network changes (usque's default), or when packets
+    // go unanswered for 2s and a probe through it fails; QUIC drops a silent
+    // connection after 25s.
+    const val DEFAULT_WARP1_ARGS =
+        "-s {sni} -m 1280 -i 1350 -P 443 -k 10s -r 1s --idle-timeout 25s --stall-timeout 2s --http2-fallback-after 2"
 
     // --wg-mtu 0 = use wg0.conf's MTU; usque always caps it to what fits inside
     // WARP1 (WARP1 MTU - 60, or - 80 for an IPv6 endpoint).
     const val DEFAULT_WG_ARGS = "--wg-mtu 0 --wg-keepalive 25"
 
-    // WARP2 rides inside wg0, where QUIC does not fit, so auto picks HTTP/2.
+    // WARP2 rides inside wg0, where QUIC does not fit, so auto picks HTTP/2. Its own
+    // stall check waits longer and only runs while WARP1 is healthy, so an outage of
+    // WARP1 is not doubled by WARP2 rebuilding itself on top.
     const val DEFAULT_WARP2_ARGS =
-        "--exit-sni {exit_sni} --exit-transport auto --exit-mtu 1280 --exit-connect-port 443"
+        "--exit-sni {exit_sni} --exit-transport auto --exit-mtu 1280 --exit-connect-port 443 --exit-stall-timeout 8s"
 
     // usque's own exit SNI (internal.ConnectSNI). Inside wg0, so the ISP never sees it.
     const val DEFAULT_WARP2_SNI = "consumer-masque.cloudflareclient.com"
@@ -75,6 +85,8 @@ object ChainArgs {
         "{wg}" to ChainManager.WG_CONFIG,
         "{exit_config}" to ChainManager.EXIT_CONFIG,
     )
+    // What a key file placeholder renders to when the keys come through stdin.
+    private const val KEYS_FROM_STDIN = "-"
 
     fun defaultArgs(hop: Hop): String = when (hop) {
         Hop.WARP1 -> DEFAULT_WARP1_ARGS
@@ -122,17 +134,24 @@ object ChainArgs {
         }
     }
 
-    /** argv after the binary path: core, then WARP1, wg0 and WARP2 flags, rendered. */
-    fun build(ctx: Context, ps: PersistentState?): List<String> =
-        render(fullTemplate(ps), values(ctx, ps))
+    /**
+     * argv after the binary path: core, then WARP1, wg0 and WARP2 flags, rendered, with
+     * the key files as "-" (ChainManager adds --secrets-stdin and pipes the keys in).
+     */
+    fun build(ps: PersistentState?): List<String> =
+        render(fullTemplate(ps), values(ps, null))
+
+    /** [build] for an old libusque.so: the key files come from [paths] (file name -> path). */
+    fun buildWithFiles(ps: PersistentState?, paths: Map<String, String>): List<String> =
+        render(fullTemplate(ps), values(ps, paths))
 
     /** The command the next start will run, for the screen's "effective" line. */
-    fun effectiveForDisplay(ctx: Context, ps: PersistentState?): String =
-        build(ctx, ps).joinToString(" ")
+    fun effectiveForDisplay(ps: PersistentState?): String =
+        (build(ps) + ChainManager.SECRETS_STDIN_FLAG).joinToString(" ")
 
     /** One hop's flags as they will be passed (placeholders filled in). */
-    fun effectiveHopForDisplay(ctx: Context, ps: PersistentState?, hop: Hop): String =
-        render(hopArgs(ps, hop), values(ctx, ps)).joinToString(" ")
+    fun effectiveHopForDisplay(ps: PersistentState?, hop: Hop): String =
+        render(hopArgs(ps, hop), values(ps, null)).joinToString(" ")
 
     private fun fullTemplate(ps: PersistentState?): String =
         listOf(CORE_TEMPLATE, hopArgs(ps, Hop.WARP1), hopArgs(ps, Hop.WG), hopArgs(ps, Hop.WARP2))
@@ -152,8 +171,9 @@ object ChainArgs {
         }
     }
 
-    private fun values(ctx: Context, ps: PersistentState?): Map<String, String> =
-        PLACEHOLDERS.mapValues { (_, file) -> File(ctx.filesDir, file).absolutePath } + mapOf(
+    // paths null: keys through stdin, every key file placeholder renders as "-".
+    private fun values(ps: PersistentState?, paths: Map<String, String>?): Map<String, String> =
+        PLACEHOLDERS.mapValues { (_, file) -> paths?.get(file) ?: KEYS_FROM_STDIN } + mapOf(
             "{sni}" to ps?.chainWarp1Sni?.trim().orEmpty(),
             "{exit_sni}" to ps?.chainWarp2Sni?.trim().orEmpty(),
         )

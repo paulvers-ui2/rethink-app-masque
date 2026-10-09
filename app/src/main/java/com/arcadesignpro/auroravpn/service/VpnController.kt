@@ -214,7 +214,20 @@ object VpnController : KoinComponent {
         Logger.i(LOG_TAG_VPN, "VPN Controller stop with context: $context")
         connectionState = null
         onConnectionStateChanged(null)
-        braveVpnService?.signalStopService(reason, userInitiated = true)
+        val service = braveVpnService
+        if (service != null) {
+            service.signalStopService(reason, userInitiated = true)
+            return
+        }
+        // No service to ask (it died, or was killed, while the switch still said on): turn
+        // the switch off here, or the home button stays on "stop" and every press is lost.
+        // The helper processes can outlive the service, so stop them too.
+        Logger.w(LOG_TAG_VPN, "stop($reason): no vpn service, clearing the on state")
+        persistentState.setVpnEnabled(false)
+        CoroutineScope(Dispatchers.IO).launch {
+            UsqueManager.stopSocksProxy()
+            ChainManager.stopChain()
+        }
     }
 
     // Re-post the persistent VPN notification.  Called when the user dismisses it on
