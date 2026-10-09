@@ -174,7 +174,7 @@ jobs:
             # version of this step authenticated the clone with
             # secrets.GITHUB_TOKEN, which had no effect here besides
             # putting a token in a URL unnecessarily.
-            git clone -q https://github.com/paulvers-ui/firestack.git /tmp/firestack
+            git clone -q "https://github.com/${{ github.repository_owner }}/firestack.git" /tmp/firestack
             cd /tmp/firestack
             git checkout -q "${FIRESTACK_COMMIT}"
             chmod +x make-aar

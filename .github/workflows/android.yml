@@ -77,7 +77,7 @@ jobs:
         if: steps.firestack-cache.outputs.cache-hit != 'true'
         run: |
           set -eu
-          git clone -q https://github.com/paulvers-ui/firestack.git /tmp/firestack
+          git clone -q "https://github.com/${{ github.repository_owner }}/firestack.git" /tmp/firestack
           cd /tmp/firestack
           git checkout -q "${FIRESTACK_COMMIT}"
           chmod +x make-aar
