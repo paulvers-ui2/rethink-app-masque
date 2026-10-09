@@ -27,6 +27,10 @@ import kotlinx.coroutines.withContext
  *   wg0.conf           middle WireGuard hop (chain-only)
  *   chain_debug.txt    verbose log, mirrors warp_debug.txt
  *
+ * The three key files are sealed by [KeyVault] and reach usque through stdin
+ * (--secrets-stdin), never as plain files; the editors see the keys as
+ * [KeyRedaction.HIDDEN].
+ *
  * Everything is modular on purpose: register WARP1, load wg0.conf, register
  * WARP2 and start the chain are independent steps the UI can run and test one
  * at a time.
@@ -65,6 +69,8 @@ object ChainManager {
     // The SOCKS port opens before the hops carry traffic, so the end-to-end
     // probe is retried while WARP1, wg0 and WARP2 come up in series.
     const val LIVENESS_WAIT_MS = 30_000L
+    // How the key bundle reaches usque, see startChainLocked.
+    const val SECRETS_STDIN_FLAG = "--secrets-stdin"
     private const val LIVENESS_RETRY_MS = 2_000L
 
     // SOCKS5 liveness probe: CONNECT to 1.1.1.1:80.
@@ -84,6 +90,8 @@ object ChainManager {
     private const val IPV6_ADDR_LEN = 16
     private const val PORT_LEN = 2
     private const val BYTE_MASK = 0xFF
+    // First printable ASCII character; anything below is escaped in JSON strings.
+    private const val SPACE = 0x20
 
     // Exit-IP check: Cloudflare's /cdn-cgi/trace over plain HTTP through a local
     // SOCKS5. The CONNECT target stays 1.1.1.1:80 (same as the liveness probe, no
@@ -127,6 +135,14 @@ object ChainManager {
     @Volatile private var deathCallback: (() -> Unit)? = null
     fun setDeathCallback(cb: (() -> Unit)?) { deathCallback = cb }
 
+    // usque's recent output (UsqueOutput), and whether this libusque.so turned out to
+    // be too old for --secrets-stdin and the reconnect flags.
+    private val output = UsqueOutput()
+    @Volatile private var legacyBinary = false
+
+    /** Why the last start failed (usque's last error line), or "" when it did not say. */
+    fun lastStartError(): String = output.lastError()
+
     // ── verbose log file (mirrors UsqueManager.warp_debug.txt) ────────────────
     private const val DEBUG_LOG_MAX_BYTES = 2L * 1024 * 1024
     const val DEBUG_LOG_NAME = "chain_debug.txt"
@@ -156,17 +172,12 @@ object ChainManager {
     }
 
     // ── state inspection, per component ───────────────────────────────────────
-    fun warp1Registered(ctx: Context): Boolean = fileNonEmpty(ctx, WARP1_CONFIG)
-    fun warp2Registered(ctx: Context): Boolean = fileNonEmpty(ctx, EXIT_CONFIG)
-    fun wgLoaded(ctx: Context): Boolean = fileNonEmpty(ctx, WG_CONFIG)
+    fun warp1Registered(ctx: Context): Boolean = KeyVault.exists(ctx, WARP1_CONFIG)
+    fun warp2Registered(ctx: Context): Boolean = KeyVault.exists(ctx, EXIT_CONFIG)
+    fun wgLoaded(ctx: Context): Boolean = KeyVault.exists(ctx, WG_CONFIG)
 
     fun chainReady(ctx: Context): Boolean =
         warp1Registered(ctx) && warp2Registered(ctx) && wgLoaded(ctx)
-
-    private fun fileNonEmpty(ctx: Context, name: String): Boolean {
-        val f = File(ctx.filesDir, name)
-        return f.exists() && f.length() > 0L
-    }
 
     private fun getBinary(ctx: Context): File {
         val bin = File(ctx.applicationInfo.nativeLibraryDir, BINARY_NAME)
@@ -175,59 +186,63 @@ object ChainManager {
     }
 
     // ── config readers / writers (UI editors use these) ───────────────────────
-    fun readFile(ctx: Context, name: String): String = try {
-        val f = File(ctx.filesDir, name)
-        if (f.exists()) f.readText() else ""
-    } catch (e: Exception) {
-        Logger.e(Logger.LOG_TAG_PROXY, "ChainManager.readFile($name): ${e.message}", e)
-        ""
+    /** A key file's text for the editors, keys shown as [KeyRedaction.HIDDEN]; "" if none. */
+    fun readFile(ctx: Context, name: String): String {
+        val data = KeyVault.read(ctx, name) ?: return ""
+        return try {
+            val text = String(data, Charsets.UTF_8)
+            if (name == WG_CONFIG) KeyRedaction.hideWg(text) else KeyRedaction.hideJson(text)
+        } finally {
+            data.fill(0)
+        }
+    }
+
+    private fun stored(ctx: Context, name: String): String? {
+        val data = KeyVault.read(ctx, name) ?: return null
+        return try { String(data, Charsets.UTF_8) } finally { data.fill(0) }
     }
 
     /**
-     * Atomically writes a WARP identity (config.json / config_exit.json) after
-     * checking it parses as a JSON object with the private_key usque needs, so a
-     * truncated paste is refused here instead of breaking the next start.
+     * Stores a WARP identity (config.json / config_exit.json) after checking it
+     * parses as a JSON object with the private_key usque needs, so a truncated
+     * paste is refused here instead of breaking the next start. Keys still
+     * reading [KeyRedaction.HIDDEN] keep their stored values.
      */
     fun writeConfigJson(ctx: Context, name: String, text: String): Boolean {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) { dlog(ctx, "writeConfigJson($name): empty"); return false }
-        val parsed = try { org.json.JSONObject(trimmed) } catch (_: org.json.JSONException) { null }
+        val restored = KeyRedaction.restoreJson(trimmed, stored(ctx, name))
+        if (restored == null) { dlog(ctx, "writeConfigJson($name): hidden key with nothing stored"); return false }
+        val parsed = try { org.json.JSONObject(restored) } catch (_: org.json.JSONException) { null }
         if (parsed == null) { dlog(ctx, "writeConfigJson($name): not a JSON object"); return false }
         if (parsed.optString(WARP_KEY_FIELD).isBlank()) {
             dlog(ctx, "writeConfigJson($name): no $WARP_KEY_FIELD")
             return false
         }
-        return atomicWrite(ctx, name, trimmed)
+        return seal(ctx, name, restored)
     }
 
     /**
-     * Writes wg0.conf after a minimal structural check (has [Interface], a
+     * Stores wg0.conf after a minimal structural check (has [Interface], a
      * PrivateKey, a [Peer] and an Endpoint). The binary does the real parse and
      * rejects AmneziaWG; this only catches obvious paste mistakes early.
      */
     fun writeWgConfig(ctx: Context, text: String): Boolean {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) { dlog(ctx, "writeWgConfig: empty"); return false }
-        val lower = trimmed.lowercase()
+        val restored = KeyRedaction.restoreWg(trimmed, stored(ctx, WG_CONFIG))
+        if (restored == null) { dlog(ctx, "writeWgConfig: hidden key with nothing stored"); return false }
+        val lower = restored.lowercase()
         val ok = lower.contains("[interface]") && lower.contains("privatekey") &&
             lower.contains("[peer]") && lower.contains("endpoint")
         if (!ok) { dlog(ctx, "writeWgConfig: missing [Interface]/PrivateKey/[Peer]/Endpoint"); return false }
-        return atomicWrite(ctx, WG_CONFIG, trimmed)
+        return seal(ctx, WG_CONFIG, restored)
     }
 
-    private fun atomicWrite(ctx: Context, name: String, text: String): Boolean = try {
-        val target = File(ctx.filesDir, name)
-        val tmp = File(ctx.filesDir, "$name.tmp")
-        tmp.writeText(text)
-        if (!tmp.renameTo(target)) { target.writeText(text); tmp.delete() }
-        // Config files hold key material; keep them owner-only.
-        try { target.setReadable(false, false); target.setReadable(true, true) } catch (_: Exception) {}
-        dlog(ctx, "atomicWrite($name): ${target.length()} bytes")
-        true
-    } catch (e: Exception) {
-        Logger.e(Logger.LOG_TAG_PROXY, "ChainManager.atomicWrite($name): ${e.message}", e)
-        dlog(ctx, "atomicWrite($name) EXCEPTION ${e.message}")
-        false
+    private fun seal(ctx: Context, name: String, text: String): Boolean {
+        val ok = KeyVault.write(ctx, name, text.toByteArray(Charsets.UTF_8))
+        dlog(ctx, "seal($name): saved=$ok (${text.length} chars)")
+        return ok
     }
 
     // ── step 1 / 3: register a WARP identity into [configName] ────────────────
@@ -238,13 +253,15 @@ object ChainManager {
      */
     suspend fun registerWarp(ctx: Context, configName: String): Boolean = withContext(Dispatchers.IO) {
         dlog(ctx, "registerWarp($configName): >>>ENTRY<<<")
+        // usque writes the new identity here; it is sealed and wiped right after. The
+        // current identity stays until the new one exists, so a failed (rate-limited)
+        // re-registration does not leave the hop without keys.
+        val configFile = KeyVault.scratchFile(ctx, configName)
         try {
             val bin = getBinary(ctx)
             if (!bin.exists()) { dlog(ctx, "BINARY NOT FOUND in jniLibs/arm64-v8a/"); return@withContext false }
             if (!bin.canExecute()) { dlog(ctx, "BINARY NOT EXECUTABLE — W^X?"); return@withContext false }
 
-            val configFile = File(ctx.filesDir, configName)
-            if (configFile.exists()) { configFile.delete(); dlog(ctx, "deleted old $configName") }
 
             val cmd = listOf(bin.absolutePath, "register", "--accept-tos", "-c", configFile.absolutePath)
             dlog(ctx, "cmd=${cmd.joinToString(" ")}")
@@ -264,8 +281,9 @@ object ChainManager {
             dlog(ctx, "register exit=$exit")
             dlog(ctx, "register stdout=$out")
             dlog(ctx, "register stderr=$errw")
-            val ok = exit == 0 && configFile.exists() && configFile.length() > 0L
-            dlog(ctx, "registerWarp($configName) result=$ok size=${configFile.length()}")
+            val written = configFile.length()
+            val ok = exit == 0 && written > 0L && KeyVault.adopt(ctx, configFile, configName)
+            dlog(ctx, "registerWarp($configName) result=$ok size=$written")
             // A second registration from the same IP may be rate-limited by
             // Cloudflare; the caller should surface that and allow a retry.
             ok
@@ -273,6 +291,8 @@ object ChainManager {
             dlog(ctx, "registerWarp EXCEPTION ${e.message}\n${e.stackTraceToString()}")
             Logger.e(Logger.LOG_TAG_PROXY, "registerWarp($configName) exception", e)
             false
+        } finally {
+            KeyVault.wipe(configFile)
         }
     }
 
@@ -320,50 +340,26 @@ object ChainManager {
             val ps = runCatching {
                 org.koin.java.KoinJavaComponent.get<PersistentState>(PersistentState::class.java)
             }.getOrNull()
-            val cmd = listOf(bin.absolutePath) + ChainArgs.build(ctx, ps)
-            dlog(ctx, "startChain: cmd=${cmd.joinToString(" ")}")
-            val pb = ProcessBuilder(cmd).redirectErrorStream(false)
-            pb.environment()["GODEBUG"] = "vgetrandom=off"
-            val proc = pb.start()
-            process = proc
-
-            val outThread = pumpOutput(ctx, proc.inputStream, "stdout")
-            val errThread = pumpOutput(ctx, proc.errorStream, "stderr")
-
-            // The chain brings up three tunnels in series (WARP1, then wg0, then
-            // the HTTP/2 exit), so give the port longer to appear than the
-            // single-hop path does.
-            val portReady = probePort(ctx, CHAIN_START_TIMEOUT_MS)
-            val procAlive = proc.isAlive
-            dlog(ctx, "startChain: proc.isAlive=$procAlive portReady=$portReady")
-
-            if (portReady && procAlive) {
-                portConfirmedAlive = true
-                val captured = proc
-                Thread {
-                    try {
-                        captured.waitFor()
-                        if (process === captured && portConfirmedAlive) {
-                            portConfirmedAlive = false
-                            Log.w(TAG, "chain process died unexpectedly — firing restart callback")
-                            deathCallback?.invoke()
-                        }
-                    } catch (_: Exception) {}
-                }.apply { isDaemon = true; name = "chain-death-watcher" }.start()
-            } else {
-                portConfirmedAlive = false
-                // Port never came up but the process may still be alive (e.g. a slow
-                // wg0 hostname lookup): kill it, or it would bind :40001 later as an
-                // orphan that stopChain() can no longer reach.
-                if (proc.isAlive) proc.destroyForcibly()
-                // Wait for the kill to land so the log shows the real exit code (not -1).
-                proc.waitFor(STOP_GRACE_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
-                outThread.join(OUTPUT_DRAIN_JOIN_MS); errThread.join(OUTPUT_DRAIN_JOIN_MS)
-                val code = try { proc.exitValue() } catch (_: Exception) { -1 }
-                dlog(ctx, "startChain: exit=$code")
-                process = null
+            val keys = readKeys(ctx)
+            if (keys == null) {
+                output.clear()
+                output.add("error: chain keys missing or unreadable, register / load them again")
+                dlog(ctx, "startChain: keys missing or unreadable")
+                return false
             }
-            portReady && procAlive
+            try {
+                if (!legacyBinary) {
+                    val bundle = keyBundle(keys)
+                    val args = ChainArgs.build(ps) + SECRETS_STDIN_FLAG
+                    val started = try { spawnChain(ctx, bin, args, bundle) } finally { bundle.fill(0) }
+                    if (started || !output.rejectedAFlag()) return started
+                    legacyBinary = true
+                    dlog(ctx, "startChain: libusque.so rejected a flag — retrying the old way")
+                }
+                startLegacy(ctx, bin, ps, keys)
+            } finally {
+                keys.values.forEach { it.fill(0) }
+            }
         } catch (e: Exception) {
             dlog(ctx, "startChain: EXCEPTION ${e.message}\n${e.stackTraceToString()}")
             Logger.e(Logger.LOG_TAG_PROXY, "startChain exception", e)
@@ -371,10 +367,121 @@ object ChainManager {
         }
     }
 
+    // The three key files, unsealed; null if one is missing or unreadable.
+    private fun readKeys(ctx: Context): Map<String, ByteArray>? {
+        val out = LinkedHashMap<String, ByteArray>()
+        for (name in listOf(WARP1_CONFIG, EXIT_CONFIG, WG_CONFIG)) {
+            val data = KeyVault.read(ctx, name)
+            if (data == null) {
+                out.values.forEach { it.fill(0) }
+                return null
+            }
+            out[name] = data
+        }
+        return out
+    }
+
+    // {"config": <WARP1>, "exit_config": <WARP2>, "wg": "<wg0.conf>"} for --secrets-stdin,
+    // assembled from bytes so the keys are not copied into Strings.
+    private fun keyBundle(keys: Map<String, ByteArray>): ByteArray {
+        val buf = java.io.ByteArrayOutputStream()
+        fun put(s: String) = buf.write(s.toByteArray(Charsets.UTF_8))
+        put("{\"config\":"); buf.write(keys.getValue(WARP1_CONFIG))
+        put(",\"exit_config\":"); buf.write(keys.getValue(EXIT_CONFIG))
+        put(",\"wg\":"); buf.write(jsonString(keys.getValue(WG_CONFIG)))
+        put("}")
+        return buf.toByteArray()
+    }
+
+    // [text] (UTF-8) as a JSON string literal, escaped byte by byte.
+    private fun jsonString(text: ByteArray): ByteArray {
+        val out = java.io.ByteArrayOutputStream(text.size + 2)
+        out.write('"'.code)
+        for (b in text) {
+            val c = b.toInt() and BYTE_MASK
+            when {
+                c == '"'.code || c == '\\'.code -> { out.write('\\'.code); out.write(c) }
+                c == '\n'.code -> { out.write('\\'.code); out.write('n'.code) }
+                c == '\r'.code -> { out.write('\\'.code); out.write('r'.code) }
+                c == '\t'.code -> { out.write('\\'.code); out.write('t'.code) }
+                c < SPACE -> out.write(String.format(java.util.Locale.ROOT, "\\u%04x", c).toByteArray(Charsets.US_ASCII))
+                else -> out.write(c)
+            }
+        }
+        out.write('"'.code)
+        return out.toByteArray()
+    }
+
+    /**
+     * For a libusque.so without --secrets-stdin or the reconnect flags: the keys go in
+     * private scratch files that are wiped as soon as usque has read them (it reads them
+     * once, at start, before the SOCKS port opens).
+     */
+    private fun startLegacy(ctx: Context, bin: File, ps: PersistentState?, keys: Map<String, ByteArray>): Boolean {
+        val files = keys.mapValues { (name, data) -> KeyVault.scratchFile(ctx, name).also { it.writeBytes(data) } }
+        return try {
+            val args = UsqueOutput.withoutNewerFlags(ChainArgs.buildWithFiles(ps, files.mapValues { it.value.absolutePath }))
+            spawnChain(ctx, bin, args, null)
+        } finally {
+            files.values.forEach { KeyVault.wipe(it) }
+        }
+    }
+
+    /** Spawns the chain with [args] and [stdin] (the key bundle, or nothing), then waits for its port. */
+    private fun spawnChain(ctx: Context, bin: File, args: List<String>, stdin: ByteArray?): Boolean {
+        val cmd = listOf(bin.absolutePath) + args
+        dlog(ctx, "startChain: cmd=${cmd.joinToString(" ")}")
+        output.clear()
+        val pb = ProcessBuilder(cmd).redirectErrorStream(false)
+        pb.environment()["GODEBUG"] = "vgetrandom=off"
+        val proc = pb.start()
+        process = proc
+        UsqueManager.writeStdin(proc, stdin)
+
+        val outThread = pumpOutput(ctx, proc.inputStream, "stdout")
+        val errThread = pumpOutput(ctx, proc.errorStream, "stderr")
+
+        // The chain brings up three tunnels in series (WARP1, then wg0, then
+        // the HTTP/2 exit), so give the port longer to appear than the
+        // single-hop path does.
+        val portReady = probePort(ctx, CHAIN_START_TIMEOUT_MS)
+        val procAlive = proc.isAlive
+        dlog(ctx, "startChain: proc.isAlive=$procAlive portReady=$portReady")
+
+        if (portReady && procAlive) {
+            portConfirmedAlive = true
+            val captured = proc
+            Thread {
+                try {
+                    captured.waitFor()
+                    if (process === captured && portConfirmedAlive) {
+                        portConfirmedAlive = false
+                        Log.w(TAG, "chain process died unexpectedly — firing restart callback")
+                        deathCallback?.invoke()
+                    }
+                } catch (_: Exception) {}
+            }.apply { isDaemon = true; name = "chain-death-watcher" }.start()
+        } else {
+            portConfirmedAlive = false
+            // Port never came up but the process may still be alive (e.g. a slow
+            // wg0 hostname lookup): kill it, or it would bind :40001 later as an
+            // orphan that stopChain() can no longer reach.
+            if (proc.isAlive) proc.destroyForcibly()
+            // Wait for the kill to land so the log shows the real exit code (not -1).
+            proc.waitFor(STOP_GRACE_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+            outThread.join(OUTPUT_DRAIN_JOIN_MS); errThread.join(OUTPUT_DRAIN_JOIN_MS)
+            val code = try { proc.exitValue() } catch (_: Exception) { -1 }
+            dlog(ctx, "startChain: exit=$code reason=${output.lastError()}")
+            process = null
+        }
+        return portReady && procAlive
+    }
+
     private fun pumpOutput(ctx: Context, stream: java.io.InputStream, label: String): Thread =
         Thread {
             try {
                 stream.bufferedReader().forEachLine { line ->
+                    output.add(line)
                     dlog(ctx, "chain $label: $line")
                     Logger.i(Logger.LOG_TAG_PROXY, "chain: $line")
                 }

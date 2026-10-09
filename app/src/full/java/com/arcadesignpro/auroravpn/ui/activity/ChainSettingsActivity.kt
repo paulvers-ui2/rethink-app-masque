@@ -416,7 +416,15 @@ class ChainSettingsActivity : AppCompatActivity(R.layout.activity_chain) {
         lifecycleScope.launch {
             val live = startAndRoute()
             setBusy(false)
-            toast(getString(if (live) R.string.chain_connected else R.string.chain_connect_failed))
+            // Say why it failed (usque's last error line) instead of only that it did.
+            val reason = ChainManager.lastStartError()
+            toast(
+                when {
+                    live -> getString(R.string.chain_connected)
+                    reason.isEmpty() -> getString(R.string.chain_connect_failed)
+                    else -> getString(R.string.chain_connect_failed_reason, reason)
+                }
+            )
             refreshAllStatus(); refreshLog()
         }
     }
@@ -652,9 +660,9 @@ class ChainSettingsActivity : AppCompatActivity(R.layout.activity_chain) {
 
     /** The per-hop "effective" lines, the full command and the MTU plan. */
     private fun refreshCommand() {
-        argsEditors.forEach { it.effective.text = ChainArgs.effectiveHopForDisplay(this, persistentState, it.hop) }
+        argsEditors.forEach { it.effective.text = ChainArgs.effectiveHopForDisplay(persistentState, it.hop) }
         b.chainCmdCore.text = ChainArgs.CORE_TEMPLATE
-        b.chainCmdFull.text = "libusque.so " + ChainArgs.effectiveForDisplay(this, persistentState)
+        b.chainCmdFull.text = "libusque.so " + ChainArgs.effectiveForDisplay(persistentState)
         val plan = ChainArgs.mtuPlan(this, persistentState)
         b.chainMtuSummary.text = getString(
             R.string.chain_mtu_summary,

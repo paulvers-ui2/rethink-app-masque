@@ -72,7 +72,9 @@ object UsqueManager {
     // The Proxy settings screen exposes the exact argument string passed to
     // libusque.so and lets advanced users edit it. Two placeholders are
     // substituted at process-start time:
-    //   {config} → absolute path of the on-disk config.json
+    //   {config} → "-": the keys reach usque through stdin (--secrets-stdin,
+    //              added at start), never as a file; an old libusque.so gets
+    //              the path of a scratch copy wiped right after it starts
     //   {sni}    → current warpSpoofedSni value (may be empty)
     // The default template mirrors the historical hard-coded arg list so
     // existing installs behave identically until the user opts in.
@@ -85,17 +87,26 @@ object UsqueManager {
     // handshakes through WARP stalled about a second after every connect.
     private const val DEFAULT_SOCKS_QUIC_ARGS = "-i 1350"
 
+    // How fast a dead tunnel is rebuilt. usque reconnects at once when the network
+    // changes (Wi-Fi <-> mobile data, on by default), and when packets go out with nothing
+    // coming back for 2s and a probe through the tunnel gets no answer either; otherwise
+    // QUIC drops a silent connection after 25s. -r 1s spaces failed reconnects, and
+    // --always-reconnect rebuilds the tunnel right away instead of waiting for traffic.
+    // -k 10s keeps mobile NAT bindings open.
+    private const val DEFAULT_SOCKS_RESILIENCE_ARGS =
+        "-k 10s -r 1s --always-reconnect --idle-timeout 25s --stall-timeout 2s"
+
     // How usque resolves SOCKS target names: DNS-over-HTTPS to Cloudflare by IP, DNSSEC
     // checked (usque >= v0.1.0). --doh and --dnssec validate are usque's defaults anyway;
     // they are spelled out so the args screen shows them and they can be edited there.
     private const val DEFAULT_SOCKS_DNS_ARGS =
         "--doh --dnssec validate --doh-url https://1.1.1.1/dns-query --doh-url https://1.0.0.1/dns-query"
 
-    /** Returns the default arg string: {sni} appended when SNI is set, then the QUIC and DNS flags. */
+    /** Returns the default arg string: {sni} appended when SNI is set, then the QUIC, reconnect and DNS flags. */
     fun defaultSocksArgsTemplate(sni: String): String {
         val base = DEFAULT_SOCKS_ARGS_TEMPLATE
         val withSni = if (sni.isNotBlank()) "$base -s {sni}" else base
-        return "$withSni $DEFAULT_SOCKS_QUIC_ARGS $DEFAULT_SOCKS_DNS_ARGS"
+        return "$withSni $DEFAULT_SOCKS_QUIC_ARGS $DEFAULT_SOCKS_RESILIENCE_ARGS $DEFAULT_SOCKS_DNS_ARGS"
     }
 
     /** Returns the args string currently shown in the UI editor: the user
@@ -173,7 +184,7 @@ object UsqueManager {
             dlog(ctx, "writeSocksArgs: cleared override (default will be used)")
             return true
         }
-        // Must contain {config} so the config.json path always reaches usque.
+        // Must contain {config} so the keys always reach usque.
         if (!normalized.contains("{config}")) {
             dlog(ctx, "writeSocksArgs: refused — missing {config} placeholder")
             return false
@@ -202,23 +213,19 @@ object UsqueManager {
     /** Renders the fully-substituted argv string that will be handed to
      *  libusque.so on next start. Used by the settings UI to show the
      *  advanced user the *effective* command line (with {config} and
-     *  {sni} already resolved) so they can verify their edits landed. */
-    fun effectiveSocksArgsForDisplay(ctx: Context): String {
-        val ps = try {
-            org.koin.java.KoinJavaComponent
-                .get<PersistentState>(PersistentState::class.java)
-        } catch (_: Throwable) { null }
-        val sni = ps?.warpSpoofedSni?.trim().orEmpty()
-        val override = ps?.warpUsqueArgs?.trim().orEmpty()
-        val template = if (override.isNotEmpty()) override
-                       else defaultSocksArgsTemplate(sni)
-        val configPath = File(ctx.filesDir, "config.json").absolutePath
-        return template
-            .replace("{config}", configPath)
-            .replace("{sni}", sni)
-    }
+     *  {sni} already resolved) so they can verify their edits landed.
+     *  The keys go through stdin, so {config} shows as "-". */
+    fun effectiveSocksArgsForDisplay(ctx: Context): String =
+        (buildSocksArgs(ctx, KEYS_FROM_STDIN) + SECRETS_STDIN_FLAG).joinToString(" ")
 
     // ─────────────────────────────────────────────────────────────────────────
+
+    // The WARP identity, kept sealed by KeyVault (never as a plain config.json).
+    const val CONFIG_NAME = "config.json"
+    // libusque.so reads the keys from stdin (see startSocksProxyLocked) ...
+    private const val SECRETS_STDIN_FLAG = "--secrets-stdin"
+    // ... and is told so with "-c -".
+    private const val KEYS_FROM_STDIN = "-"
 
     private fun getBinary(ctx: Context): File {
         val nativeDir = ctx.applicationInfo.nativeLibraryDir
@@ -227,31 +234,31 @@ object UsqueManager {
         return bin
     }
 
-    fun isRegistered(ctx: Context): Boolean {
-        val f = File(ctx.filesDir, "config.json")
-        Log.d("WARP_DEBUG", "isRegistered: path=${f.absolutePath} exists=${f.exists()} size=${f.length()}")
-        return f.exists() && f.length() > 0L
-    }
+    fun isRegistered(ctx: Context): Boolean = KeyVault.exists(ctx, CONFIG_NAME)
+
+    /** True when the stored WARP identity can no longer be decrypted (see KeyVault.damaged). */
+    fun keysDamaged(ctx: Context): Boolean = KeyVault.damaged(ctx, CONFIG_NAME)
 
     /**
-     * Returns the raw text of the WARP config.json (empty string if it does
-     * not exist). Used by the Proxy settings UI to let advanced users edit
-     * the tunnel configuration produced by `usque register`.
+     * Returns the text of the WARP config.json (empty string if there is none)
+     * for the Proxy settings editor, with the private key and token shown as
+     * [KeyRedaction.HIDDEN]: advanced users can still edit endpoints and the
+     * like, but the keys never appear on screen.
      */
     fun readConfig(ctx: Context): String {
+        val data = KeyVault.read(ctx, CONFIG_NAME) ?: return ""
         return try {
-            val f = File(ctx.filesDir, "config.json")
-            if (f.exists()) f.readText() else ""
-        } catch (e: Exception) {
-            Logger.e(Logger.LOG_TAG_PROXY, "readConfig error: ${e.message}", e)
-            ""
+            KeyRedaction.hideJson(String(data, Charsets.UTF_8))
+        } finally {
+            data.fill(0)
         }
     }
 
     /**
-     * Atomically overwrites config.json with [text]. Validates that [text] is
-     * well-formed JSON before touching the on-disk file so a bad paste cannot
-     * corrupt the tunnel state. Returns true on success.
+     * Replaces config.json with [text] (fields still reading [KeyRedaction.HIDDEN]
+     * keep their stored values). Validates that [text] is well-formed JSON before
+     * touching the stored identity so a bad paste cannot corrupt the tunnel state.
+     * Returns true on success.
      */
     fun writeConfig(ctx: Context, text: String): Boolean {
         val trimmed = text.trim()
@@ -259,35 +266,31 @@ object UsqueManager {
             dlog(ctx, "writeConfig: refused empty payload")
             return false
         }
-        // Lightweight JSON sanity check — a real parse would pull in a
-        // dependency for no gain; usque itself will reject truly broken files.
-        val looksJson = (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
-            (trimmed.startsWith("[") && trimmed.endsWith("]"))
-        if (!looksJson) {
-            dlog(ctx, "writeConfig: refused non-JSON payload")
+        val stored = KeyVault.read(ctx, CONFIG_NAME)
+        val restored = KeyRedaction.restoreJson(trimmed, stored?.toString(Charsets.UTF_8))
+        stored?.fill(0)
+        if (restored == null) {
+            dlog(ctx, "writeConfig: refused — a hidden key has no stored value to keep")
             return false
         }
-        return try {
-            val target = File(ctx.filesDir, "config.json")
-            val tmp = File(ctx.filesDir, "config.json.tmp")
-            tmp.writeText(trimmed)
-            if (!tmp.renameTo(target)) {
-                // renameTo can fail across some FS states; fall back to copy.
-                target.writeText(trimmed)
-                tmp.delete()
-            }
-            dlog(ctx, "writeConfig: wrote ${target.length()} bytes")
-            true
-        } catch (e: Exception) {
-            Logger.e(Logger.LOG_TAG_PROXY, "writeConfig error: ${e.message}", e)
-            dlog(ctx, "writeConfig EXCEPTION ${e.message}")
-            false
+        // Must be the JSON object usque writes, with its key, or the next start fails.
+        val parsed = try { org.json.JSONObject(restored) } catch (_: org.json.JSONException) { null }
+        if (parsed == null || parsed.optString("private_key").isBlank()) {
+            dlog(ctx, "writeConfig: refused — not a JSON object with a private_key")
+            return false
         }
+        val ok = KeyVault.write(ctx, CONFIG_NAME, restored.toByteArray(Charsets.UTF_8))
+        dlog(ctx, "writeConfig: saved=$ok (${restored.length} chars)")
+        return ok
     }
 
     suspend fun registerWithWarp(context: Context): Boolean = withContext(Dispatchers.IO) {
         // NOTE: do NOT call clearDebugLog here — logs must persist across register→start sequence
         dlog(context, "registerWithWarp: >>>ENTRY<<<")
+        // usque writes the new identity here; it is sealed into the vault and wiped right
+        // after. The current identity stays until the new one exists, so a failed
+        // re-registration (Cloudflare rate limit, no network) no longer leaves WARP without keys.
+        val scratch = KeyVault.scratchFile(context, CONFIG_NAME)
         try {
             val bin = getBinary(context)
 
@@ -300,14 +303,8 @@ object UsqueManager {
                 return@withContext false
             }
 
-            val configFile = File(context.filesDir, "config.json")
-            if (configFile.exists()) {
-                configFile.delete()
-                dlog(context, "deleted old config.json")
-            }
-
             // --accept-tos skips the stdin TOS prompt entirely
-            val cmd = listOf(bin.absolutePath, "register", "--accept-tos", "-c", configFile.absolutePath)
+            val cmd = listOf(bin.absolutePath, "register", "--accept-tos", "-c", scratch.absolutePath)
             dlog(context, "cmd=${cmd.joinToString(" ")}")
 
             val pb = ProcessBuilder(cmd).redirectErrorStream(false)
@@ -335,9 +332,9 @@ object UsqueManager {
             dlog(context, "exit=$exit")
             dlog(context, "stdout=${stdoutWriter}")
             dlog(context, "stderr=${stderrWriter}")
-            dlog(context, "configExists=${configFile.exists()} size=${configFile.length()}")
+            dlog(context, "configWritten=${scratch.exists()} size=${scratch.length()}")
 
-            val ok = exit == 0 && configFile.exists() && configFile.length() > 0L
+            val ok = exit == 0 && scratch.length() > 0L && KeyVault.adopt(context, scratch, CONFIG_NAME)
             dlog(context, "result=$ok")
             ok
 
@@ -345,6 +342,8 @@ object UsqueManager {
             dlog(context, "EXCEPTION ${e.message}\n${e.stackTraceToString()}")
             Logger.e(Logger.LOG_TAG_PROXY, "registerWithWarp exception", e)
             false
+        } finally {
+            KeyVault.wipe(scratch)
         }
     }
 
@@ -363,6 +362,34 @@ object UsqueManager {
             }
         }
     }
+
+    /**
+     * Stops usque and starts it again, even when the process is alive and its port answers.
+     * [startSocksProxy] keeps a live process on purpose, which made every "tunnel is dead,
+     * restart it" call a no-op for a process that was up but no longer carrying traffic.
+     */
+    suspend fun restartSocksProxy(ctx: Context): Boolean = withContext(Dispatchers.IO) {
+        startLock.withLock {
+            isStarting = true
+            try {
+                dlog(ctx, "restartSocksProxy: hard restart")
+                stopSocksProxy()
+                waitForPortRelease(ctx, SOCKS_PORT, timeoutMs = 2000)
+                startSocksProxyLocked(ctx)
+            } finally {
+                isStarting = false
+            }
+        }
+    }
+
+    /** Why the last start failed (usque's last error line), or "" when it did not say. */
+    fun lastStartError(): String = output.lastError()
+
+    // usque's recent output, see UsqueOutput.
+    private val output = UsqueOutput()
+
+    // Set once this libusque.so rejected the newer flags; later starts leave them out.
+    @Volatile private var legacyBinary = false
 
     /**
      * Must only be called while [startLock] is held.
@@ -421,73 +448,119 @@ object UsqueManager {
                 return false
             }
 
-            val configFile = File(ctx.filesDir, "config.json")
-            dlog(ctx, "startSocksProxy: configExists=${configFile.exists()} size=${configFile.length()}")
-
-            // Build argument list. If the user saved a custom override string
-            // (Proxy settings > WARP > "libusque.so arguments"), it is used
-            // verbatim after {config}/{sni} substitution; otherwise fall back
-            // to the default template derived from warpSpoofedSni.
-            val args = buildSocksArgs(ctx, configFile.absolutePath)
-            val cmd = mutableListOf(bin.absolutePath)
-            cmd += args
-            dlog(ctx, "startSocksProxy: cmd=${cmd.joinToString(" ")}")
-
-            val pb = ProcessBuilder(cmd).redirectErrorStream(false)
-            pb.environment()["GODEBUG"] = "vgetrandom=off"
-            val proc = pb.start()
-            process = proc
-
-            // Drain stdout and stderr in background threads so the process doesn't block on a
-            // full pipe buffer, logging each line as it arrives (see pumpOutput).
-            val outThread = pumpOutput(ctx, proc.inputStream, "stdout")
-            val errThread = pumpOutput(ctx, proc.errorStream, "stderr")
-
-            // Wait for the port to actually be listening (up to 5s) instead of a blind sleep.
-            // This prevents a race on slow devices where 1500ms wasn't enough.
-            val portReady = probePort(ctx, SOCKS_PORT, timeoutMs = 5000)
-            val procAlive = proc.isAlive
-            dlog(ctx, "startSocksProxy: proc.isAlive=$procAlive portReady=$portReady")
-
-            // Bug fix 3: only register the death watcher when our process is *still* alive after
-            // probePort returns. If proc died while we were probing (e.g. couldn't bind because
-            // the orphan-reattach path above was skipped on a borderline race), treat it as a
-            // failure rather than setting portConfirmedAlive and triggering an instant callback.
-            if (portReady && procAlive) {
-                portConfirmedAlive = true
-                // Immediate death detection: daemon thread blocks on waitFor() and fires
-                // deathCallback the instant the usque child process exits unexpectedly.
-                // This collapses the recovery gap from ≤20 s (watchdog tick) to <1 s.
-                val capturedProc = proc
-                Thread {
-                    try {
-                        capturedProc.waitFor()
-                        // Only fire if this is still the active process and the port was confirmed
-                        // alive (i.e., this is an unexpected death, not an intentional stopSocksProxy).
-                        if (process === capturedProc && portConfirmedAlive) {
-                            portConfirmedAlive = false
-                            Log.w("WARP_DEBUG", "usque process died unexpectedly — firing restart callback")
-                            deathCallback?.invoke()
-                        }
-                    } catch (_: Exception) {}
-                }.apply { isDaemon = true; name = "usque-death-watcher" }.start()
-            } else {
-                portConfirmedAlive = false
-                // Process already exited — let the pumps flush its last lines before reporting.
-                outThread.join(2000)
-                errThread.join(2000)
-                val exit = try { proc.exitValue() } catch (_: Exception) { -1 }
-                dlog(ctx, "startSocksProxy: exit=$exit")
-                process = null
+            val keys = KeyVault.read(ctx, CONFIG_NAME)
+            if (keys == null) {
+                output.clear()
+                output.add("error: WARP keys missing or unreadable, register again")
+                dlog(ctx, "startSocksProxy: no readable WARP keys")
+                return false
             }
-
-            portReady && procAlive
-
+            try {
+                if (!legacyBinary) {
+                    // Build argument list. If the user saved a custom override string
+                    // (Proxy settings > WARP > "libusque.so arguments"), it is used
+                    // verbatim after {config}/{sni} substitution; otherwise fall back
+                    // to the default template derived from warpSpoofedSni.
+                    val args = buildSocksArgs(ctx, KEYS_FROM_STDIN) + SECRETS_STDIN_FLAG
+                    val bundle = keyBundle(keys)
+                    val started = try { spawnSocksProxy(ctx, bin, args, bundle) } finally { bundle.fill(0) }
+                    if (started || !output.rejectedAFlag()) return started
+                    // An older libusque.so that does not know the newer flags: run it the old
+                    // way rather than leave WARP down.
+                    legacyBinary = true
+                    dlog(ctx, "startSocksProxy: libusque.so rejected a flag — retrying the old way")
+                }
+                startLegacy(ctx, bin, keys)
+            } finally {
+                keys.fill(0)
+            }
         } catch (e: Exception) {
             dlog(ctx, "startSocksProxy: EXCEPTION ${e.message}\n${e.stackTraceToString()}")
             Logger.e(Logger.LOG_TAG_PROXY, "startSocksProxy exception", e)
             false
         }
+    }
+
+    /**
+     * For a libusque.so without --secrets-stdin or the reconnect flags: the keys go in a
+     * private scratch file that is wiped as soon as usque has read them (it reads its config
+     * once, at start, before the SOCKS port opens).
+     */
+    private fun startLegacy(ctx: Context, bin: File, keys: ByteArray): Boolean {
+        val scratch = KeyVault.scratchFile(ctx, CONFIG_NAME)
+        return try {
+            scratch.writeBytes(keys)
+            val args = UsqueOutput.withoutNewerFlags(buildSocksArgs(ctx, scratch.absolutePath))
+            spawnSocksProxy(ctx, bin, args, null)
+        } finally {
+            KeyVault.wipe(scratch)
+        }
+    }
+
+    /**
+     * Spawns usque with [args], writes [stdin] (the key bundle, or nothing) into its stdin,
+     * and waits for its SOCKS port; see [startSocksProxyLocked].
+     */
+    private fun spawnSocksProxy(ctx: Context, bin: File, args: List<String>, stdin: ByteArray?): Boolean {
+        val cmd = mutableListOf(bin.absolutePath)
+        cmd += args
+        dlog(ctx, "startSocksProxy: cmd=${cmd.joinToString(" ")}")
+
+        output.clear()
+        val pb = ProcessBuilder(cmd).redirectErrorStream(false)
+        pb.environment()["GODEBUG"] = "vgetrandom=off"
+        val proc = pb.start()
+        process = proc
+        writeStdin(proc, stdin)
+
+        // Drain stdout and stderr in background threads so the process doesn't block on a
+        // full pipe buffer, logging each line as it arrives (see pumpOutput).
+        val outThread = pumpOutput(ctx, proc.inputStream, "stdout")
+        val errThread = pumpOutput(ctx, proc.errorStream, "stderr")
+
+        // Wait for the port to actually be listening (up to 5s) instead of a blind sleep.
+        // This prevents a race on slow devices where 1500ms wasn't enough.
+        val portReady = probePort(ctx, SOCKS_PORT, timeoutMs = 5000)
+        val procAlive = proc.isAlive
+        dlog(ctx, "startSocksProxy: proc.isAlive=$procAlive portReady=$portReady")
+
+        // Bug fix 3: only register the death watcher when our process is *still* alive after
+        // probePort returns. If proc died while we were probing (e.g. couldn't bind because
+        // the orphan-reattach path above was skipped on a borderline race), treat it as a
+        // failure rather than setting portConfirmedAlive and triggering an instant callback.
+        if (portReady && procAlive) {
+            portConfirmedAlive = true
+            // Immediate death detection: daemon thread blocks on waitFor() and fires
+            // deathCallback the instant the usque child process exits unexpectedly.
+            // This collapses the recovery gap from ≤20 s (watchdog tick) to <1 s.
+            val capturedProc = proc
+            Thread {
+                try {
+                    capturedProc.waitFor()
+                    // Only fire if this is still the active process and the port was confirmed
+                    // alive (i.e., this is an unexpected death, not an intentional stopSocksProxy).
+                    if (process === capturedProc && portConfirmedAlive) {
+                        portConfirmedAlive = false
+                        Log.w("WARP_DEBUG", "usque process died unexpectedly — firing restart callback")
+                        deathCallback?.invoke()
+                    }
+                } catch (_: Exception) {}
+            }.apply { isDaemon = true; name = "usque-death-watcher" }.start()
+            return true
+        }
+
+        portConfirmedAlive = false
+        process = null
+        // The port never came up but the process may still be running: kill it, or it binds
+        // :40000 later as an orphan that stopSocksProxy() can no longer reach.
+        if (proc.isAlive) proc.destroyForcibly()
+        proc.waitFor(STOP_GRACE_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+        // Let the pumps flush its last lines before reporting.
+        outThread.join(2000)
+        errThread.join(2000)
+        val exit = try { proc.exitValue() } catch (_: Exception) { -1 }
+        dlog(ctx, "startSocksProxy: exit=$exit reason=${output.lastError()}")
+        return false
     }
 
     /**
@@ -501,6 +574,7 @@ object UsqueManager {
         Thread {
             try {
                 stream.bufferedReader().forEachLine { line ->
+                    output.add(line)
                     dlog(ctx, "usque $label: $line")
                     Logger.i(Logger.LOG_TAG_PROXY, "usque: $line")
                 }
@@ -510,6 +584,20 @@ object UsqueManager {
             name = "usque-$label"
             start()
         }
+
+    /** {"config": <config.json>}, built from bytes so the keys are not copied into Strings. */
+    private fun keyBundle(config: ByteArray): ByteArray =
+        "{\"config\":".toByteArray(Charsets.UTF_8) + config + "}".toByteArray(Charsets.UTF_8)
+
+    /**
+     * Hands [data] to the process through its stdin pipe and closes it. A process that
+     * already exited (it rejected a flag) breaks the pipe; that is reported by its output.
+     */
+    fun writeStdin(proc: Process, data: ByteArray?) {
+        try {
+            proc.outputStream.use { out -> if (data != null) out.write(data) }
+        } catch (_: java.io.IOException) {}
+    }
 
     /** Wait until port [port] stops accepting connections or [timeoutMs] elapses. */
     private fun waitForPortRelease(ctx: Context, port: Int, timeoutMs: Long): Boolean {

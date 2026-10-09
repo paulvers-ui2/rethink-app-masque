@@ -1977,6 +1977,8 @@
     <string name="warp_register_failed">WARP registration failed. Try again.</string>
     <string name="warp_not_registered">Register with WARP first</string>
     <string name="warp_start_failed">Failed to start WARP tunnel</string>
+    <string name="warp_start_failed_reason">Failed to start WARP tunnel: %1$s</string>
+    <string name="warp_status_connecting">Connecting…</string>
     <string name="warp_status_active">Connected — routing via Cloudflare WARP</string>
     <string name="warp_status_registered">Registered — tap Connect to enable</string>
     <string name="warp_status_unregistered">Not registered</string>
@@ -2035,6 +2037,7 @@
     <string name="chain_connected">Chain connected: the VPN now exits via WARP2 (apps → WARP2 → wg0 → WARP1)</string>
     <string name="chain_tunnel_title">WARP chain (WARP1 → wg0 → WARP2)</string>
     <string name="chain_connect_failed">Chain failed to start — see log</string>
+    <string name="chain_connect_failed_reason">Chain failed to start: %1$s</string>
     <string name="chain_not_ready">Finish steps 1–3 first</string>
     <string name="chain_status_connected">Connected</string>
     <string name="chain_status_ready">Ready — not connected</string>

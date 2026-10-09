@@ -202,13 +202,20 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
     @Volatile
     private var usqueWarpRunning: Boolean = false
     private var usqueWatchdogJob: kotlinx.coroutines.Job? = null
-    @Volatile private var usqueLastWatchdogRestartMs = 0L
     @Volatile private var usqueNetworkLost = false // Sprint 17: WiFi→void→LTE handoff tracking
     // Chain mode (ChainManager) keep-alive, see startChainWatchdog()
     private var chainWatchdogJob: kotlinx.coroutines.Job? = null
     @Volatile private var chainLastRestartMs = 0L
     @Volatile private var chainRestartBackoffMs = CHAIN_RESTART_MIN_INTERVAL_MS
     private val chainRestartLock = kotlinx.coroutines.sync.Mutex()
+    // Simple WARP restarts (see recoverUsque): one at a time, backing off while usque
+    // keeps dying soon after it starts.
+    private val usqueRecoverLock = kotlinx.coroutines.sync.Mutex()
+    @Volatile private var usqueRestartBackoffMs = USQUE_RESTART_MIN_MS
+    @Volatile private var usqueStartedAtMs = 0L
+    @Volatile private var usqueDozeArmedAtMs = 0L
+    // Set by onDestroy; the stop watchdog (see signalStopService) checks it.
+    @Volatile private var destroyed = false
 
     // Sprint 20 Bug 1: Doze-proof alarm watchdog receiver and helpers.
     // setAndAllowWhileIdle fires through deep Doze without requiring SCHEDULE_EXACT_ALARM
@@ -331,9 +338,12 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
         var attempt = 0
         while (attempt < maxAttempts && simpleWarpActive()) {
             attempt++
-            // Re-register if the config was lost (e.g. clear-data or first boot after update).
-            if (!UsqueManager.isRegistered(applicationContext)) {
-                Logger.w(LOG_TAG_VPN, "usque: retry $attempt — config missing, re-registering")
+            // Re-register if the config was lost (e.g. clear-data or first boot after update),
+            // or its keys can no longer be decrypted (Keystore reset): left alone, WARP would
+            // stay down for good on a phone nobody is watching.
+            val damaged = UsqueManager.isRegistered(applicationContext) && UsqueManager.keysDamaged(applicationContext)
+            if (!UsqueManager.isRegistered(applicationContext) || damaged) {
+                Logger.w(LOG_TAG_VPN, "usque: retry $attempt — config ${if (damaged) "unreadable" else "missing"}, re-registering")
                 val registered = UsqueManager.registerWithWarp(applicationContext)
                 if (!registered) {
                     Logger.e(LOG_TAG_VPN, "usque: retry $attempt — re-registration failed, giving up")
@@ -342,6 +352,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
             }
             val ok = UsqueManager.startSocksProxy(applicationContext)
             if (ok) {
+                usqueStartedAtMs = elapsedRealtime()
                 Logger.i(LOG_TAG_VPN, "usque: retry succeeded on attempt $attempt/$maxAttempts")
                 // NOTE: the WG -> S5 double hop feature (WgHopManager) has been
                 // removed entirely -- there is no auto-hop-into-WARP behavior here.
@@ -362,9 +373,107 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
     private fun simpleWarpActive(): Boolean =
         persistentState.usqueEnabled && !persistentState.chainEnabled
 
-    // For restarts that run after a delay: the chain may have taken over meanwhile.
-    private suspend fun startUsqueIfSimple() {
-        if (simpleWarpActive()) UsqueManager.startSocksProxy(applicationContext)
+    /**
+     * Brings simple WARP back: the one place every recovery path (death callback, watchdog,
+     * Doze alarm, network change) goes through, so only one runs at a time. The first restart
+     * after usque has been up for a while is immediate; while it keeps dying within
+     * USQUE_STABLE_MS of starting, each restart waits twice as long (1s up to a minute).
+     * [hard] restarts a process that is alive but carries no traffic; a plain start
+     * would keep it.
+     */
+    // The early returns are the "nothing to do" exits: WARP was switched off meanwhile.
+    @Suppress("ReturnCount")
+    private suspend fun recoverUsque(reason: String, hard: Boolean) {
+        if (!usqueRecoverLock.tryLock()) return // a recovery is already running
+        try {
+            if (!simpleWarpActive()) return
+            val upFor = elapsedRealtime() - usqueStartedAtMs
+            if (usqueStartedAtMs > 0L && upFor < USQUE_STABLE_MS) {
+                Logger.w(LOG_TAG_VPN, "usque: $reason ${upFor}ms after starting, retrying in ${usqueRestartBackoffMs}ms")
+                kotlinx.coroutines.delay(usqueRestartBackoffMs)
+                usqueRestartBackoffMs = (usqueRestartBackoffMs * 2).coerceAtMost(USQUE_RESTART_MAX_MS)
+                if (!simpleWarpActive()) return
+            } else {
+                usqueRestartBackoffMs = USQUE_RESTART_MIN_MS
+                Logger.w(LOG_TAG_VPN, "usque: $reason, restarting now")
+            }
+            // Pre-flush stale DoH HTTP/2 connections to :40000 before the port goes dark
+            // (Sprint 20 Bug 2), and again once it is back so DNS picks up the new process.
+            refreshResolvers()
+            if (hard) withContext(Dispatchers.IO) { UsqueManager.stopSocksProxy() }
+            startUsqueWithRetry()
+            refreshResolvers()
+        } finally {
+            usqueRecoverLock.unlock()
+        }
+    }
+
+    // Simple WARP keep-alive. Installed unconditionally and gated per tick, so turning WARP
+    // on after the service started is covered too (it used to be installed only when WARP
+    // was already on at onCreate, leaving a WARP switched on later with no watchdog at all).
+    private fun startUsqueWatchdog() {
+        // Immediate death detection: UsqueManager fires this the moment the child exits.
+        UsqueManager.setDeathCallback {
+            io("usqueDeathRestart") { recoverUsque("process died", hard = false) }
+        }
+        usqueWatchdogJob?.cancel()
+        usqueWatchdogJob = io("usqueWatchdog") {
+            var failures = 0
+            while (true) {
+                kotlinx.coroutines.delay(USQUE_WATCHDOG_INTERVAL_MS)
+                failures = if (simpleWarpActive()) usqueWatchdogRound(failures) else 0
+            }
+        }
+    }
+
+    // One watchdog round; returns how many probes in a row have failed so far.
+    private suspend fun usqueWatchdogRound(failures: Int): Int {
+        armUsqueDozeAlarmIfStale()
+        return when {
+            !UsqueManager.isRunning() -> {
+                recoverUsque("watchdog: process not running", hard = false)
+                0
+            }
+            UsqueManager.probeUsqueLiveness() -> 0
+            // usque rebuilds a dead tunnel by itself within seconds (network switch,
+            // stalled path); restart the process only if two checks in a row fail.
+            failures + 1 >= USQUE_WATCHDOG_MAX_FAILURES -> {
+                recoverUsque("watchdog: no traffic through WARP", hard = true)
+                0
+            }
+            else -> failures + 1
+        }
+    }
+
+    // The Doze alarm is a dead man's switch: while this watchdog runs it keeps pushing the
+    // alarm out, so it only fires once Doze has frozen the coroutine delay().
+    private fun armUsqueDozeAlarmIfStale() {
+        val now = elapsedRealtime()
+        if (now - usqueDozeArmedAtMs < USQUE_DOZE_REARM_MS) return
+        usqueDozeArmedAtMs = now
+        scheduleUsqueDozeAlarm()
+    }
+
+    // usque reconnects by itself about a second after a network switch (--watch-network);
+    // look again a few seconds later and restart it only if traffic still does not flow.
+    private fun verifyWarpAfterNetworkChange(why: String) {
+        io("usqueNetworkCheck") {
+            kotlinx.coroutines.delay(NETWORK_CHANGE_CHECK_DELAY_MS)
+            if (!simpleWarpActive()) return@io
+            val ok = UsqueManager.isRunning() && UsqueManager.probeUsqueLiveness()
+            if (!ok) recoverUsque("no traffic ${NETWORK_CHANGE_CHECK_DELAY_MS}ms after $why", hard = UsqueManager.isRunning())
+        }
+    }
+
+    // Same for the chain: WARP1 follows the network by itself; restart only if it did not.
+    private fun verifyChainAfterNetworkChange(why: String) {
+        io("chainNetworkCheck") {
+            kotlinx.coroutines.delay(NETWORK_CHANGE_CHECK_DELAY_MS + CHAIN_EXTRA_SETTLE_MS)
+            if (!persistentState.chainEnabled) return@io
+            if (!ChainManager.isRunning() || !ChainManager.probeChainLiveness()) {
+                restartChain("no traffic through the chain after $why")
+            }
+        }
     }
 
     // Chain mode (WARP1 -> wg0 -> WARP2, SOCKS5 :40001) keep-alive. Installed
@@ -379,36 +488,49 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
             var failures = 0
             while (true) {
                 kotlinx.coroutines.delay(CHAIN_WATCHDOG_INTERVAL_MS)
-                val healthy = !persistentState.chainEnabled ||
-                    (ChainManager.isRunning() && ChainManager.probeChainLiveness())
-                // Traffic flows again: the next outage starts from the shortest wait.
-                if (healthy) chainRestartBackoffMs = CHAIN_RESTART_MIN_INTERVAL_MS
-                failures = if (healthy) 0 else failures + 1
-                if (failures >= CHAIN_WATCHDOG_MAX_FAILURES) {
-                    failures = 0
-                    restartChain("watchdog: $CHAIN_WATCHDOG_MAX_FAILURES failed probes")
-                }
+                failures = if (persistentState.chainEnabled) chainWatchdogRound(failures) else 0
             }
         }
     }
 
-    // The watchdog, the death callback and screen unlock can all ask for a restart at
-    // once: only one runs (the others are dropped, not queued), none within
-    // CHAIN_RESTART_MIN_INTERVAL_MS of the last, and none while a start (from the
-    // chain screen or VPN start) is still bringing the hops up.
+    // One watchdog round; returns how many probes in a row have failed so far.
+    private suspend fun chainWatchdogRound(failures: Int): Int = when {
+        // A dead process needs no second opinion.
+        !ChainManager.isRunning() -> {
+            restartChain("watchdog: chain process not running")
+            0
+        }
+        ChainManager.probeChainLiveness() -> {
+            // Traffic flows again: the next outage starts from the shortest wait.
+            chainRestartBackoffMs = CHAIN_RESTART_MIN_INTERVAL_MS
+            0
+        }
+        failures + 1 >= CHAIN_WATCHDOG_MAX_FAILURES -> {
+            restartChain("watchdog: $CHAIN_WATCHDOG_MAX_FAILURES failed probes")
+            0
+        }
+        else -> failures + 1
+    }
+
+    // The watchdog, the death callback, a network change and screen unlock can all ask for
+    // a restart at once: only one runs (the others are covered by it). A request that comes
+    // within the backoff of the last restart waits for it instead of being dropped, which
+    // used to leave a chain that died right after a restart down until the next watchdog
+    // round; it then restarts only if the chain is still not carrying traffic.
     private suspend fun restartChain(reason: String) {
         if (!chainRestartLock.tryLock()) return
         try {
-            if (chainRestartAllowed()) hardRestartChain(reason)
+            val wait = chainRestartBackoffMs - (System.currentTimeMillis() - chainLastRestartMs)
+            if (wait > 0) {
+                Logger.i(LOG_TAG_VPN, "chain: $reason, restarting in ${wait}ms")
+                kotlinx.coroutines.delay(wait)
+                val recovered = ChainManager.isRunning() && ChainManager.probeChainLiveness()
+                if (recovered) return
+            }
+            if (persistentState.chainEnabled && !ChainManager.isChainStarting()) hardRestartChain(reason)
         } finally {
             chainRestartLock.unlock()
         }
-    }
-
-    private fun chainRestartAllowed(): Boolean {
-        val sinceLast = System.currentTimeMillis() - chainLastRestartMs
-        return persistentState.chainEnabled && !ChainManager.isChainStarting() &&
-            sinceLast >= chainRestartBackoffMs
     }
 
     // A hard restart: startChain() is a no-op while the process lives and the port
@@ -426,7 +548,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
         // The user may have switched the chain off while it was being stopped.
         if (persistentState.chainEnabled) {
             val ok = ChainManager.startChain(applicationContext)
-            Logger.i(LOG_TAG_VPN, "chain: restart result: $ok")
+            Logger.i(LOG_TAG_VPN, "chain: restart result: $ok ${if (ok) "" else ChainManager.lastStartError()}")
         }
         refreshResolvers()
     }
@@ -568,14 +690,34 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
         // if something in that sequence ever hangs unexpectedly, not a normal-case budget.
         private const val USQUE_DOZE_WAKELOCK_TIMEOUT_MS = 30_000L
 
-        // Chain mode keep-alive: probe every 20 s like usque, but restart only after
-        // three misses in a row (60 s: usque re-dials a dropped hop by itself and
-        // WARP1 moves to HTTP/2 after two failed QUIC connects; a restart rebuilds
-        // all three hops in series). Restarts back off from 10 s to 5 min.
-        private const val CHAIN_WATCHDOG_INTERVAL_MS = 20_000L
+        // Chain mode keep-alive: probe every 15 s, but restart a live process only after
+        // three misses in a row (usque rebuilds a dropped hop by itself within seconds and
+        // WARP1 moves to HTTP/2 after two failed QUIC connects; a restart rebuilds all
+        // three hops in series). A dead process is restarted at once. Restarts back off
+        // from 2 s to 1 min, so an unattended phone is never left down for long.
+        private const val CHAIN_WATCHDOG_INTERVAL_MS = 15_000L
         private const val CHAIN_WATCHDOG_MAX_FAILURES = 3
-        private const val CHAIN_RESTART_MIN_INTERVAL_MS = 10_000L
-        private const val CHAIN_RESTART_MAX_INTERVAL_MS = 5 * 60 * 1000L
+        private const val CHAIN_RESTART_MIN_INTERVAL_MS = 2_000L
+        private const val CHAIN_RESTART_MAX_INTERVAL_MS = 60_000L
+        // The chain brings three hops up in series; give it a little longer than WARP.
+        private const val CHAIN_EXTRA_SETTLE_MS = 4_000L
+
+        // Simple WARP keep-alive (see startUsqueWatchdog / recoverUsque): a liveness probe
+        // every 10 s; a live process with no traffic is restarted after two misses in a
+        // row (usque usually repairs the tunnel itself first). Restarts of a usque that
+        // keeps dying back off from 1 s to 1 min, and reset once it has stayed up 1 min.
+        private const val USQUE_WATCHDOG_INTERVAL_MS = 10_000L
+        private const val USQUE_WATCHDOG_MAX_FAILURES = 2
+        private const val USQUE_RESTART_MIN_MS = 1_000L
+        private const val USQUE_RESTART_MAX_MS = 60_000L
+        private const val USQUE_STABLE_MS = 60_000L
+        // The Doze alarm is re-armed this often while the watchdog runs (dead man's switch).
+        private const val USQUE_DOZE_REARM_MS = 4 * 60 * 1000L
+        // After a network switch, how long usque gets to reconnect on its own.
+        private const val NETWORK_CHANGE_CHECK_DELAY_MS = 4_000L
+
+        // A user stop that has not finished after this long is forced (see signalStopService).
+        private const val TEARDOWN_RETRY_MS = 5_000L
 
         // WARP safety timer -- see PersistentState.warpAutoDisableEnabled's doc comment.
         const val ACTION_WARP_AUTO_DISABLE = "com.arcadesignpro.auroravpn.WARP_AUTO_DISABLE"
@@ -1889,138 +2031,10 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
             handleFirewallBubbleIfNeeded()
         }
 
-          startChainWatchdog()
-
-          // Sprint 14: start usque watchdog — probes liveness every 20s and restarts on dead tunnel.
-          // Sprint 21 fix 1: watchdog now probes even when isRunning()=false (process killed by OS).
-          // Previously the guard `&& UsqueManager.isRunning()` caused the watchdog to skip
-          // the restart whenever the process was fully dead — the exact scenario we need to handle.
-          if (persistentState.usqueEnabled) {
-              // Sprint 21 fix 2: immediate death detection via callback. When usque's child
-              // process exits, UsqueManager fires this callback instantly (< 1 s) so we don't
-              // have to wait for the next 20 s watchdog tick. The watchdog is kept as a belt-
-              // and-suspenders fallback for cases where the death-watcher thread loses a race.
-              UsqueManager.setDeathCallback {
-                  io("usqueDeathRestart") {
-                      if (!simpleWarpActive()) return@io
-                      Logger.w(LOG_TAG_VPN, "usque: death callback fired — immediate restart")
-                      refreshResolvers()
-                      startUsqueWithRetry()
-                      usqueLastWatchdogRestartMs = System.currentTimeMillis()
-                      refreshResolvers()
-                  }
-              }
-
-              usqueWatchdogJob?.cancel()
-              usqueWatchdogJob = io("usqueWatchdog") {
-                  while (true) {
-                      kotlinx.coroutines.delay(20_000L)
-                      if (simpleWarpActive()) {
-                          // Probe even when isRunning()=false: the process may be dead and the
-                          // death-watcher may not have fired yet (race). probeUsqueLiveness()
-                          // returns false on connection refused, which correctly triggers restart.
-                          val tunnelOk = UsqueManager.isRunning() && UsqueManager.probeUsqueLiveness()
-                          if (!tunnelOk) {
-                              Logger.w(LOG_TAG_VPN, "usque: watchdog — tunnel down (running=${UsqueManager.isRunning()}), restarting")
-                              // Sprint 20 Bug 2: pre-flush stale DoH HTTP/2 connection to port 40000
-                              // BEFORE stopSocksProxy makes the port dark (~200ms gap). Without this
-                              // the cached HTTP/2 conn receives "use of closed network connection"
-                              // which breaks all DNS queries during the restart window.
-                              refreshResolvers()
-                              startUsqueWithRetry()
-                              usqueLastWatchdogRestartMs = System.currentTimeMillis()
-                              // Sprint 15: post-start flush so DNS transport picks up the new port
-                              refreshResolvers()
-                          }
-                      }
-                  }
-              }
-
-              // Sprint 20 Bug 1: coroutine delay() is fully suspended by Android Doze mode.
-              // The watchdog above went silent for 2.6 hours because Doze froze the delay().
-              // Register a dynamic BroadcastReceiver + AlarmManager.setAndAllowWhileIdle()
-              // alarm that fires through deep Doze and runs the same liveness check so the
-              // tunnel is never stuck dead for hours while asleep.
-              //
-              // Sprint 22 fix: onReceive() itself runs with an implicit system-held wakeup,
-              // but that is released the instant onReceive() returns -- and io("usqueDozeCheck")
-              // launches its work asynchronously and returns immediately, so the device was
-              // free to fall back into Doze before the network liveness probe inside that
-              // coroutine ever got to run. Confirmed in production: the alarm fired reliably
-              // every cycle all night (visible in logcat), yet the tunnel stayed dead for over
-              // 10 hours because the check body never got far enough to detect it, let alone
-              // restart it. usqueDozeWakeLock below is acquired synchronously in onReceive()
-              // (guaranteed to run) and released only once the async check + restart +
-              // reschedule sequence fully completes, bridging that gap.
-              if (usqueDozeReceiver == null) {
-                  usqueDozeReceiver = object : android.content.BroadcastReceiver() {
-                      // Both catch(Exception) blocks below wrap OS interaction (PowerManager,
-                      // WakeLock) purely to log-and-continue: a wakelock failure must not
-                      // prevent the liveness check itself from running, and this is an
-                      // internal watchdog with no user-facing failure path to report to.
-                      @Suppress("TooGenericExceptionCaught")
-                      override fun onReceive(ctx: android.content.Context, intent: android.content.Intent) {
-                          if (intent.action != ACTION_USQUE_DOZE_WATCHDOG) return
-                          if (!simpleWarpActive()) return
-                          Logger.i(LOG_TAG_VPN, "usque: Doze alarm fired — checking liveness")
-
-                          val pm = ctx.getSystemService(android.content.Context.POWER_SERVICE) as? android.os.PowerManager
-                          val wl = pm?.newWakeLock(
-                              android.os.PowerManager.PARTIAL_WAKE_LOCK,
-                              "$TAG:usqueDozeCheck"
-                          )
-                          try {
-                              wl?.acquire(USQUE_DOZE_WAKELOCK_TIMEOUT_MS)
-                          } catch (e: Exception) {
-                              // WAKE_LOCK is a normal permission declared in the manifest, so this
-                              // should never fail -- but a missing wakelock must not block the
-                              // liveness check itself, only remove its Doze-survival guarantee.
-                              Logger.w(LOG_TAG_VPN, "usque: could not acquire Doze wakelock: ${e.message}")
-                          }
-                          usqueDozeWakeLock = wl
-
-                          io("usqueDozeCheck") {
-                              try {
-                                  // Sprint 21: probe even if isRunning()=false (process may be dead).
-                                  // probeUsqueLiveness() returns false on connection refused, which
-                                  // is the correct dead-process signal — no isRunning() guard needed.
-                                  val tunnelOk = UsqueManager.isRunning() && UsqueManager.probeUsqueLiveness()
-                                  if (!tunnelOk) {
-                                      Logger.w(
-                                          LOG_TAG_VPN,
-                                          "usque: Doze watchdog — tunnel down (running=${UsqueManager.isRunning()}), restarting"
-                                      )
-                                      refreshResolvers() // Bug 2: pre-flush before port goes dark
-                                      startUsqueWithRetry()
-                                      usqueLastWatchdogRestartMs = System.currentTimeMillis()
-                                      refreshResolvers() // post-start flush
-                                  }
-                              } finally {
-                                  // Reschedule next Doze alarm regardless (keeps the chain alive),
-                                  // then release the wakelock -- in that order, so a failure in the
-                                  // check above can never leave the chain unscheduled.
-                                  scheduleUsqueDozeAlarm()
-                                  try {
-                                      usqueDozeWakeLock?.let { if (it.isHeld) it.release() }
-                                  } catch (e: Exception) {
-                                      Logger.w(LOG_TAG_VPN, "usque: error releasing Doze wakelock: ${e.message}")
-                                  }
-                                  usqueDozeWakeLock = null
-                              }
-                          }
-                      }
-                  }
-                  // Android 13+ (API 33) requires RECEIVER_NOT_EXPORTED for non-system broadcast receivers.
-                  // Omitting this flag causes a SecurityException crash on targetSdk=33+ (confirmed BraveVPNService.onCreate).
-                  ContextCompat.registerReceiver(
-                      this,
-                      usqueDozeReceiver,
-                      android.content.IntentFilter(ACTION_USQUE_DOZE_WATCHDOG),
-                      ContextCompat.RECEIVER_NOT_EXPORTED
-                  )
-              }
-              scheduleUsqueDozeAlarm()
-          }
+        startChainWatchdog()
+        // Sprint 14/21: simple WARP keep-alive (liveness probe + instant death callback).
+        startUsqueWatchdog()
+        registerUsqueDozeReceiver()
 
         // WARP auto-disable receiver: registered unconditionally (not gated behind
         // usqueEnabled like the block above), since the setting can be toggled from
@@ -2122,6 +2136,90 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
         }
     }
 
+
+    // Sprint 20 Bug 1: coroutine delay() is fully suspended by Android Doze mode.
+    // The watchdog went silent for 2.6 hours because Doze froze the delay().
+    // A dynamic BroadcastReceiver + AlarmManager.setAndAllowWhileIdle() alarm fires
+    // through deep Doze and runs the same liveness check so the tunnel is never stuck
+    // dead for hours while asleep. The watchdog keeps re-arming it while it runs.
+    //
+    // Sprint 22 fix: onReceive() itself runs with an implicit system-held wakeup,
+    // but that is released the instant onReceive() returns -- and io("usqueDozeCheck")
+    // launches its work asynchronously and returns immediately, so the device was
+    // free to fall back into Doze before the network liveness probe inside that
+    // coroutine ever got to run. Confirmed in production: the alarm fired reliably
+    // every cycle all night (visible in logcat), yet the tunnel stayed dead for over
+    // 10 hours because the check body never got far enough to detect it, let alone
+    // restart it. usqueDozeWakeLock below is acquired synchronously in onReceive()
+    // (guaranteed to run) and released only once the async check + restart +
+    // reschedule sequence fully completes, bridging that gap.
+    private fun registerUsqueDozeReceiver() {
+        if (usqueDozeReceiver != null) return
+        usqueDozeReceiver = object : android.content.BroadcastReceiver() {
+            // Both catch(Exception) blocks below wrap OS interaction (PowerManager,
+            // WakeLock) purely to log-and-continue: a wakelock failure must not
+            // prevent the liveness check itself from running, and this is an
+            // internal watchdog with no user-facing failure path to report to.
+            @Suppress("TooGenericExceptionCaught")
+            override fun onReceive(ctx: android.content.Context, intent: android.content.Intent) {
+                if (intent.action != ACTION_USQUE_DOZE_WATCHDOG) return
+                if (!simpleWarpActive()) return
+                Logger.i(LOG_TAG_VPN, "usque: Doze alarm fired — checking liveness")
+
+                val pm = ctx.getSystemService(android.content.Context.POWER_SERVICE) as? android.os.PowerManager
+                val wl = pm?.newWakeLock(
+                    android.os.PowerManager.PARTIAL_WAKE_LOCK,
+                    "$TAG:usqueDozeCheck"
+                )
+                try {
+                    wl?.acquire(USQUE_DOZE_WAKELOCK_TIMEOUT_MS)
+                } catch (e: Exception) {
+                    // WAKE_LOCK is a normal permission declared in the manifest, so this
+                    // should never fail -- but a missing wakelock must not block the
+                    // liveness check itself, only remove its Doze-survival guarantee.
+                    Logger.w(LOG_TAG_VPN, "usque: could not acquire Doze wakelock: ${e.message}")
+                }
+                usqueDozeWakeLock = wl
+
+                io("usqueDozeCheck") { usqueDozeCheck() }
+            }
+        }
+        // Android 13+ (API 33) requires RECEIVER_NOT_EXPORTED for non-system broadcast receivers.
+        // Omitting this flag causes a SecurityException crash on targetSdk=33+ (confirmed BraveVPNService.onCreate).
+        ContextCompat.registerReceiver(
+            this,
+            usqueDozeReceiver,
+            android.content.IntentFilter(ACTION_USQUE_DOZE_WATCHDOG),
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+    }
+
+    // The Doze alarm's check, run while usqueDozeWakeLock holds the device awake.
+    @Suppress("TooGenericExceptionCaught")
+    private suspend fun usqueDozeCheck() {
+        try {
+            // probeUsqueLiveness() returns false on connection refused, which
+            // is the correct dead-process signal.
+            val running = UsqueManager.isRunning()
+            if (!running || !UsqueManager.probeUsqueLiveness()) {
+                recoverUsque("Doze watchdog: tunnel down (running=$running)", hard = running)
+            }
+        } finally {
+            // Reschedule the next Doze alarm regardless (keeps the chain alive),
+            // then release the wakelock -- in that order, so a failure in the
+            // check above can never leave the chain unscheduled.
+            if (simpleWarpActive()) {
+                usqueDozeArmedAtMs = elapsedRealtime()
+                scheduleUsqueDozeAlarm()
+            }
+            try {
+                usqueDozeWakeLock?.let { if (it.isHeld) it.release() }
+            } catch (e: Exception) {
+                Logger.w(LOG_TAG_VPN, "usque: error releasing Doze wakelock: ${e.message}")
+            }
+            usqueDozeWakeLock = null
+        }
+    }
 
     private fun registerUserPresentReceiver() {
         val filter = IntentFilter().apply {
@@ -2521,6 +2619,12 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
         )
 
         VpnController.onConnectionStateChanged(State.NEW)
+
+        // A start after a stop that has not finished yet: the next stop must not be
+        // ignored as a duplicate, and the helper watchdogs it cancelled come back.
+        teardownInFlight.set(false)
+        if (usqueWatchdogJob?.isActive != true) startUsqueWatchdog()
+        if (chainWatchdogJob?.isActive != true) startChainWatchdog()
 
         ui {
             // Initialize the value whenever the vpn is started.
@@ -3334,12 +3438,35 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
     // tear down the VPN, defeating the lockdown promise.
     private val teardownInFlight = java.util.concurrent.atomic.AtomicBoolean(false)
 
+    @Volatile private var teardownStartedMs = 0L
+
     fun signalStopService(reason: String, userInitiated: Boolean = true) {
         if (!userInitiated) notifyUserOnVpnFailure()
+        if (userInitiated) {
+            // The user's word is final: flip the switch now, so the home button reads
+            // "start" at once and nothing (the home screen's auto-start, the onTaskRemoved
+            // restart alarm, an out-of-sync restart) brings the tunnel back while it is
+            // being torn down. onDestroy used to be the first to do this, and a slow
+            // teardown let the app restart itself under the user.
+            persistentState.setVpnEnabled(false)
+            cancelRestartAlarm()
+        }
         if (!teardownInFlight.compareAndSet(false, true)) {
-            Logger.w(LOG_TAG_VPN, "AUDIT (VULN-A): teardown already in flight, ignoring duplicate signalStopService($reason)")
+            // A stop is already under way. If it has been stuck for a while (a restart
+            // holding the serializer, a native call that does not return), force it
+            // instead of ignoring the press: this flag used to stay set for the life of
+            // the service, so every later Stop was a no-op and the VPN never stopped.
+            val stuckFor = elapsedRealtime() - teardownStartedMs
+            if (stuckFor >= TEARDOWN_RETRY_MS) {
+                forceTeardown("$reason, stop pending ${stuckFor}ms")
+            } else {
+                Logger.w(LOG_TAG_VPN, "AUDIT (VULN-A): teardown already in flight, ignoring duplicate signalStopService($reason)")
+            }
             return
         }
+        teardownStartedMs = elapsedRealtime()
+        stopHelperProcesses()
+        watchTeardown(reason)
         io(reason) {
             try {
                 stopVpnAdapter()
@@ -3361,6 +3488,83 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
             Logger.crash(LOG_TAG_VPN, "AUDIT (VULN-A): stopSelf threw: ${t.message}", t as? Exception)
         }
         Logger.i(LOG_TAG_VPN, "stopped vpn adapter & service: $reason, $userInitiated")
+    }
+
+    // usque (simple WARP) and the chain are child processes the tunnel uses. Stop their
+    // watchdogs first so nothing restarts them, then the processes, off the main thread.
+    // onDestroy does this again (a no-op by then); doing it here keeps a slow teardown
+    // from leaving them running. onStartCommand reinstalls the watchdogs.
+    private fun stopHelperProcesses() {
+        UsqueManager.setDeathCallback(null)
+        ChainManager.setDeathCallback(null)
+        usqueWatchdogJob?.cancel()
+        usqueWatchdogJob = null
+        chainWatchdogJob?.cancel()
+        chainWatchdogJob = null
+        io("stopHelpers") {
+            UsqueManager.stopSocksProxy()
+            ChainManager.stopChain()
+        }
+    }
+
+    // If the service is still alive TEARDOWN_RETRY_MS after a stop, force the stop.
+    private fun watchTeardown(reason: String) {
+        ui {
+            kotlinx.coroutines.delay(TEARDOWN_RETRY_MS)
+            if (!destroyed && teardownInFlight.get()) forceTeardown("$reason, still up after ${TEARDOWN_RETRY_MS}ms")
+        }
+    }
+
+    // The normal stop is stuck, most likely behind a restart that holds the serializer.
+    // Close the tunnel from here instead (GoVpnAdapter.closeTun ignores a second close),
+    // which lets Android unbind and destroy the service, take the notification down and
+    // ask to stop again.
+    @Suppress("TooGenericExceptionCaught")
+    private fun forceTeardown(why: String) {
+        Logger.w(LOG_TAG_VPN, "stop: forcing teardown ($why)")
+        teardownStartedMs = elapsedRealtime()
+        stopHelperProcesses()
+        val adapter = vpnAdapter
+        vpnAdapter = null
+        if (adapter != null) {
+            io("forceStop") {
+                try {
+                    adapter.closeTun()
+                } catch (t: Throwable) {
+                    Logger.crash(LOG_TAG_VPN, "stop: forced closeTun threw: ${t.message}", t as? Exception)
+                }
+            }
+        }
+        try {
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+        } catch (t: Throwable) {
+            Logger.w(LOG_TAG_VPN, "stop: stopForeground threw: ${t.message}")
+        }
+        try {
+            stopSelf()
+        } catch (t: Throwable) {
+            Logger.w(LOG_TAG_VPN, "stop: stopSelf threw: ${t.message}")
+        }
+        watchTeardown("forced")
+    }
+
+    // The backup alarm onTaskRemoved schedules to bring the service back; a user stop
+    // must not be undone by it a second later.
+    @Suppress("TooGenericExceptionCaught")
+    private fun cancelRestartAlarm() {
+        try {
+            val intent = Intent(applicationContext, BraveVPNService::class.java).apply { setPackage(packageName) }
+            val pi = PendingIntent.getService(
+                applicationContext,
+                RESTART_ALARM_REQUEST_CODE,
+                intent,
+                PendingIntent.FLAG_NO_CREATE or PendingIntent.FLAG_IMMUTABLE
+            ) ?: return
+            (getSystemService(ALARM_SERVICE) as? AlarmManager)?.cancel(pi)
+            pi.cancel()
+        } catch (t: Throwable) {
+            Logger.w(LOG_TAG_VPN, "stop: could not cancel the restart alarm: ${t.message}")
+        }
     }
 
     private suspend fun stopVpnAdapter() =
@@ -3680,58 +3884,33 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
                 NetworkAlertManager.fire(applicationContext, NetworkAlertManager.Kind.INTERFACE_SWITCH)
             }
 
-            // Sprint 17: restart usque on ANY interface transition, including WiFi→void→LTE.
-            // The old Sprint 14 check (networkSwitched) only fired when BOTH prev and curr
-            // were non-empty. When WiFi drops first: currHandles={} → false. When LTE appears:
-            // prevHandles={} → false again. Neither leg fired, leaving a zombie WARP tunnel.
-            // Now we track three cases via usqueNetworkLost:
-            //   direct handoff  (prev>0 && curr>0 && different)  → restart immediately
+            // Sprint 17: react to ANY interface transition, including WiFi→void→LTE, tracked
+            // in three cases via usqueNetworkLost:
+            //   direct handoff  (prev>0 && curr>0 && different)  → check now
             //   network gone    (prev>0 && curr==0)               → set usqueNetworkLost flag
-            //   network back    (prev==0 && curr>0 && flag set)   → restart after 1.5s settle
-            if (simpleWarpActive()) {
-                val msSinceWatchdog = System.currentTimeMillis() - usqueLastWatchdogRestartMs
-                val prevSz = prevHandles.size
-                val currSz = currHandles.size
-                when {
-                    networkSwitched && msSinceWatchdog > 5_000L -> {
-                        // direct handoff: WiFi→LTE with no gap
-                        io("usqueNetworkAdapt") {
-                            kotlinx.coroutines.delay(1500L)
-                            Logger.i(LOG_TAG_VPN, "usque: restarting for direct interface switch (WiFi↔LTE)")
-                            // Sprint 20 Bug 2: pre-flush stale DoH HTTP/2 conn before port 40000
-                            // goes dark so "use of closed network connection" never surfaces
-                            refreshResolvers()
-                            usqueLastWatchdogRestartMs = System.currentTimeMillis()
-                            startUsqueIfSimple()
-                            refreshResolvers() // post-start flush
-                        }
-                    }
-                    prevSz > 0 && currSz == 0 -> {
-                        // network gone (e.g. WiFi dropped, LTE not yet)
-                        Logger.i(LOG_TAG_VPN, "usque: network lost, flagging for restart on recovery")
-                        usqueNetworkLost = true
-                    }
-                    prevSz == 0 && currSz > 0 && usqueNetworkLost -> {
-                        // network recovered after a gap (LTE appeared after WiFi drop)
-                        usqueNetworkLost = false
-                        // Sprint 20 Bug 3: 4 rapid VPN fd-swaps in 9s triggered restarts #7–#9
-                        // because this branch had no debounce guard. The direct-handoff branch
-                        // above guards with msSinceWatchdog > 5_000L; apply the same guard here
-                        // so back-to-back lost/recovered cycles don't cascade into restart storms.
-                        if (msSinceWatchdog > 5_000L) {
-                            io("usqueNetworkAdapt") {
-                                kotlinx.coroutines.delay(1500L)
-                                Logger.i(LOG_TAG_VPN, "usque: network recovered after loss, restarting WARP tunnel")
-                                refreshResolvers() // Sprint 20 Bug 2: pre-flush before port goes dark
-                                usqueLastWatchdogRestartMs = System.currentTimeMillis()
-                                startUsqueIfSimple()
-                                refreshResolvers() // post-start flush
-                            }
-                        } else {
-                            Logger.i(LOG_TAG_VPN, "usque: network recovered but skipping restart — within ${5_000 - msSinceWatchdog}ms debounce window (Bug3 guard)")
-                        }
-                    }
+            //   network back    (prev==0 && curr>0 && flag set)   → check now
+            // usque itself reconnects about a second after the switch; the check restarts it
+            // only if traffic still does not flow a few seconds later. (This used to call a
+            // plain start, which does nothing while the process is alive: a WARP left on the
+            // old network stayed dead until QUIC's idle timeout.)
+            val prevSz = prevHandles.size
+            val currSz = currHandles.size
+            val why = when {
+                networkSwitched -> "interface switch"
+                prevSz > 0 && currSz == 0 -> {
+                    usqueNetworkLost = true
+                    Logger.i(LOG_TAG_VPN, "usque: network lost, checking WARP once it is back")
+                    null
                 }
+                prevSz == 0 && currSz > 0 && usqueNetworkLost -> {
+                    usqueNetworkLost = false
+                    "network back after a loss"
+                }
+                else -> null
+            }
+            if (why != null) {
+                if (simpleWarpActive()) verifyWarpAfterNetworkChange(why)
+                if (persistentState.chainEnabled) verifyChainAfterNetworkChange(why)
             }
             // force restart when network count changes from/to 0, or network itself switched
             val forceRestart = (prevSize == 0 && currSize > 0) || (prevSize > 0 && currSize == 0) || networkSwitched
@@ -4274,6 +4453,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
     }
 
     override fun onDestroy() {
+        destroyed = true
         // Sprint 21: clear death callback first so the watcher thread cannot fire a restart
         // after we have already torn down the VPN service and stopped usque intentionally.
         UsqueManager.setDeathCallback(null)
@@ -6934,13 +7114,11 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
             if (persistentState.chainEnabled) checkChainAfterUnlock()
             if (simpleWarpActive()) {
                 // Sprint 21: probe even if isRunning()=false (process may be dead after Doze).
-                val tunnelOk = UsqueManager.isRunning() && UsqueManager.probeUsqueLiveness()
+                val running = UsqueManager.isRunning()
+                val tunnelOk = running && UsqueManager.probeUsqueLiveness()
                 if (!tunnelOk) {
-                    Logger.w(LOG_TAG_VPN, "usque: screenUnlock — tunnel down (running=${UsqueManager.isRunning()}), restarting after Doze")
-                    refreshResolvers() // Bug 2: pre-flush stale DoH conn before port goes dark
-                    startUsqueWithRetry()
-                    usqueLastWatchdogRestartMs = System.currentTimeMillis()
-                    refreshResolvers() // post-start flush
+                    // A live process that carries nothing is restarted for real (hard).
+                    recoverUsque("screen unlock: tunnel down after Doze (running=$running)", hard = running)
                 } else {
                     Logger.d(LOG_TAG_VPN, "usque: screenUnlock liveness probe passed — tunnel alive")
                 }
