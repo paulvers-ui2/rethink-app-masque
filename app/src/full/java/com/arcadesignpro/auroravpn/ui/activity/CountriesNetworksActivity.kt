@@ -26,6 +26,7 @@ import by.kirich1409.viewbindingdelegate.viewBinding
 import com.arcadesignpro.auroravpn.R
 import com.arcadesignpro.auroravpn.databinding.ActivityCountriesNetworksBinding
 import com.arcadesignpro.auroravpn.databinding.ItemCnEntryBinding
+import com.arcadesignpro.auroravpn.scheduler.AsnRefreshWorker
 import com.arcadesignpro.auroravpn.service.PersistentState
 import com.arcadesignpro.auroravpn.util.Themes
 import com.arcadesignpro.auroravpn.util.Utilities
@@ -38,6 +39,7 @@ import org.koin.android.ext.android.inject
 // outgoing connections to a country (or, in allowlist mode, allow only some) and
 // to a network (ASN). The lists live in PersistentState as comma-separated
 // values; the firewall reads them live (BraveVPNService.geoBlocked).
+@Suppress("TooManyFunctions")
 class CountriesNetworksActivity :
     AppCompatActivity(R.layout.activity_countries_networks) {
 
@@ -140,12 +142,14 @@ class CountriesNetworksActivity :
         persistentState.blockedAsns
             .split(",")
             .mapNotNull { it.trim().removePrefix("AS").removePrefix("as").toLongOrNull() }
-            .filter { it in 1..4294967295L }
+            .filter { it in 1..MAX_ASN }
             .distinct()
             .toMutableList()
 
     private fun saveAsns(list: List<Long>) {
         persistentState.blockedAsns = list.sorted().joinToString(",")
+        // look the networks' prefixes up from RIPEstat (or clear them) now
+        AsnRefreshWorker.enqueueNow(this)
     }
 
     private fun renderAsns() {
@@ -179,7 +183,7 @@ class CountriesNetworksActivity :
             .setView(input)
             .setPositiveButton(R.string.lbl_add) { _, _ ->
                 val asn = input.text.toString().trim().removePrefix("AS").removePrefix("as").toLongOrNull()
-                if (asn == null || asn !in 1..4294967295L) {
+                if (asn == null || asn !in 1..MAX_ASN) {
                     Utilities.showToastUiCentered(this, getString(R.string.cn_bad_asn), android.widget.Toast.LENGTH_SHORT)
                     return@setPositiveButton
                 }
@@ -209,12 +213,17 @@ class CountriesNetworksActivity :
 
     private fun flagOf(cc: String): String {
         if (cc.length != 2) return ""
-        val up = cc.uppercase()
-        val base = 0x1F1E6 - 'A'.code
-        return try {
-            String(Character.toChars(base + up[0].code)) + String(Character.toChars(base + up[1].code))
-        } catch (e: Exception) {
-            ""
-        }
+        val a = cc[0].uppercaseChar()
+        val b = cc[1].uppercaseChar()
+        if (a !in 'A'..'Z' || b !in 'A'..'Z') return ""
+        val base = FLAG_BASE - 'A'.code
+        return String(Character.toChars(base + a.code)) + String(Character.toChars(base + b.code))
+    }
+
+    companion object {
+        // the first regional-indicator code point (🇦), for building flag emoji
+        private const val FLAG_BASE = 0x1F1E6
+        // the largest valid 32-bit AS number
+        private const val MAX_ASN = 4294967295L
     }
 }
