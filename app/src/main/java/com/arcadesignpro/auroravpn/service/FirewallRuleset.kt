@@ -229,6 +229,18 @@ enum class FirewallRuleset(val id: String, val title: Int, val desc: Int, val ac
         R.string.firewall_rule_temp_allow,
         R.string.firewall_rule_temp_allow_desc ,
         R.integer.allow
+    ),
+    RULE20(
+        "Blocked country",
+        R.string.firewall_rule_block_country,
+        R.string.firewall_rule_block_country_desc,
+        R.integer.block
+    ),
+    RULE21(
+        "Blocked network",
+        R.string.firewall_rule_block_asn,
+        R.string.firewall_rule_block_asn_desc,
+        R.integer.block
     );
 
     companion object {
@@ -269,6 +281,8 @@ enum class FirewallRuleset(val id: String, val title: Int, val desc: Int, val ac
                 RULE17.id -> RULE17
                 RULE18.id -> RULE18
                 RULE19.id -> RULE19
+                RULE20.id -> RULE20
+                RULE21.id -> RULE21
                 else -> null
             }
         }
@@ -310,6 +324,8 @@ enum class FirewallRuleset(val id: String, val title: Int, val desc: Int, val ac
                 RULE16.id -> R.drawable.ic_proxy_white
                 RULE17.id -> R.drawable.ic_proxy_white
                 RULE18.id -> R.drawable.ic_filter_error
+                RULE20.id -> R.drawable.ic_global_lockdown
+                RULE21.id -> R.drawable.ic_proxy_white
                 else -> R.drawable.bs_dns_home_screen
             }
         }

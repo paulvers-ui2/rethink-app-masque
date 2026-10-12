@@ -170,6 +170,17 @@ class PersistentState(context: Context) : SimpleKrate(context), KoinComponent {
     private var _blockAppWhenBackground by
         booleanPref("background_mode").withDefault<Boolean>(false)
 
+    // Countries & networks firewall (ported from the Windows app's Countries &
+    // networks screen): the two-letter country codes to block, or -- in allowlist
+    // mode -- the only ones allowed; and the AS numbers (networks) to block. Kept
+    // as comma-separated values to avoid a DB migration. The LAN is never blocked
+    // (a private address has no country or network), and these come before every
+    // other firewall rule. Empty means the feature is off.
+    var blockedCountries by stringPref("blocked_countries").withDefault<String>("")
+    var blockedCountriesAllowlist by
+        booleanPref("blocked_countries_allowlist").withDefault<Boolean>(false)
+    var blockedAsns by stringPref("blocked_asns").withDefault<String>("")
+
     // whether to check for app updates once-a-week (on website / play-store builds)
     var checkForAppUpdate by booleanPref("check_for_app_update").withDefault<Boolean>(true)
 
