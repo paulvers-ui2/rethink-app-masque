@@ -20,8 +20,10 @@ import Logger.LOG_TAG_SCHEDULER
 import android.app.Application
 import android.content.pm.ApplicationInfo
 import android.os.StrictMode
+import com.arcadesignpro.auroravpn.scheduler.AsnRefreshWorker
 import com.arcadesignpro.auroravpn.scheduler.ScheduleManager
 import com.arcadesignpro.auroravpn.scheduler.WorkScheduler
+import com.arcadesignpro.auroravpn.service.AsnRulesManager
 import com.arcadesignpro.auroravpn.util.FirebaseErrorReporting
 import com.arcadesignpro.auroravpn.util.GlobalExceptionHandler
 import kotlinx.coroutines.CoroutineScope
@@ -68,6 +70,11 @@ class RethinkDnsApplication : Application() {
         get<WorkScheduler>().scheduleDataUsageJob()
         get<WorkScheduler>().schedulePurgeConnectionsLog()
         get<WorkScheduler>().schedulePurgeConsoleLogs()
+        // Countries & networks: load the blocked networks' prefixes from cache
+        // (so they hold at once) and refresh them from RIPEstat now and weekly
+        AsnRulesManager.loadFromCache(applicationContext)
+        AsnRefreshWorker.schedulePeriodic(applicationContext)
+        AsnRefreshWorker.enqueueNow(applicationContext)
     }
 
     private fun turnOnStrictMode() {

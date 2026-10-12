@@ -1368,6 +1368,7 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
     // country, RULE21 if it is in a blocked network (ASN), else null. The LAN is
     // never blocked (a private address resolves to no country/network). Empty
     // settings mean the feature is off, so an unused feature costs nothing.
+    @Suppress("ReturnCount")
     private fun geoBlocked(destIp: String?): FirewallRuleset? {
         if (destIp.isNullOrEmpty()) return null
         val countries = persistentState.blockedCountries

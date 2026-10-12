@@ -16,8 +16,10 @@
 
 package com.arcadesignpro.auroravpn.service
 
+import android.content.Context
 import inet.ipaddr.IPAddress
 import inet.ipaddr.IPAddressString
+import java.io.File
 import java.net.InetAddress
 
 /**
@@ -33,25 +35,55 @@ import java.net.InetAddress
  */
 object AsnRulesManager {
 
+    private const val CACHE_FILE = "blocked_asn_prefixes.txt"
+
     @Volatile private var prefixes: List<IPAddress> = emptyList()
 
     fun setPrefixes(list: List<IPAddress>) {
         prefixes = list
     }
 
+    /** Set the blocked prefixes from CIDR strings, dropping any that don't parse. */
+    fun setFromCidrs(cidrs: List<String>) {
+        prefixes = cidrs.mapNotNull { IPAddressString(it.trim()).address }
+    }
+
     fun clear() {
         prefixes = emptyList()
+    }
+
+    /** Load the last fetched prefixes from disk, so a blocked network holds at
+     *  start before the refresh worker runs. */
+    @Suppress("TooGenericExceptionCaught", "SwallowedException")
+    fun loadFromCache(context: Context) {
+        try {
+            val f = File(context.filesDir, CACHE_FILE)
+            if (f.exists()) {
+                prefixes = f.readLines().mapNotNull { IPAddressString(it.trim()).address }
+            }
+        } catch (e: Exception) {
+            // leave whatever is loaded; the worker will refresh
+        }
+    }
+
+    /** Persist the CIDR strings for [loadFromCache]. */
+    @Suppress("TooGenericExceptionCaught", "SwallowedException")
+    fun saveCache(context: Context, cidrs: List<String>) {
+        try {
+            File(context.filesDir, CACHE_FILE).writeText(cidrs.joinToString("\n"))
+        } catch (e: Exception) {
+            // best effort
+        }
     }
 
     fun isEmpty(): Boolean = prefixes.isEmpty()
 
     /** True if [inet] falls inside any blocked network's prefix. */
     fun isBlocked(inet: InetAddress?): Boolean {
-        if (inet == null) return false
         val snapshot = prefixes
-        if (snapshot.isEmpty()) return false
-        val host = inet.hostAddress ?: return false
-        val addr = IPAddressString(host).address ?: return false
-        return snapshot.any { it.isIPv4 == addr.isIPv4 && it.contains(addr) }
+        val addr = inet?.hostAddress?.let { IPAddressString(it).address }
+        return addr != null &&
+            snapshot.isNotEmpty() &&
+            snapshot.any { it.isIPv4 == addr.isIPv4 && it.contains(addr) }
     }
 }
