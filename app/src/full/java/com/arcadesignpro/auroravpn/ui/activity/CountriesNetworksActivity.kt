@@ -212,12 +212,14 @@ class CountriesNetworksActivity :
     }
 
     private fun flagOf(cc: String): String {
-        if (cc.length != 2) return ""
-        val a = cc[0].uppercaseChar()
-        val b = cc[1].uppercaseChar()
-        if (a !in 'A'..'Z' || b !in 'A'..'Z') return ""
+        val valid = cc.length == 2 && cc[0].uppercaseChar() in 'A'..'Z' && cc[1].uppercaseChar() in 'A'..'Z'
         val base = FLAG_BASE - 'A'.code
-        return String(Character.toChars(base + a.code)) + String(Character.toChars(base + b.code))
+        return if (valid) {
+            String(Character.toChars(base + cc[0].uppercaseChar().code)) +
+                String(Character.toChars(base + cc[1].uppercaseChar().code))
+        } else {
+            ""
+        }
     }
 
     companion object {
