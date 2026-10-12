@@ -1254,6 +1254,33 @@
     <string name="firewall_rule_lockdown_wg" translatable="true">Lockdown Proxy</string>
     <string name="firewall_rule_proxy_error" translatable="true">Proxy Error</string>
     <string name="firewall_rule_temp_allow" translatable="false">Temporary Allow</string>
+    <string name="firewall_rule_block_country" translatable="true">Blocked country</string>
+    <string name="firewall_rule_block_country_desc" translatable="true"><![CDATA[This connection goes to a country you blocked.<br/><br/> To change go to <i>Firewall &#8594; Countries &amp; networks</i>.]]></string>
+    <string name="firewall_rule_block_asn" translatable="true">Blocked network</string>
+    <string name="firewall_rule_block_asn_desc" translatable="true"><![CDATA[This connection goes to a network (ASN) you blocked.<br/><br/> To change go to <i>Firewall &#8594; Countries &amp; networks</i>.]]></string>
+
+    <!-- Countries & networks firewall screen -->
+    <string name="cn_title">Countries &amp; networks</string>
+    <string name="cn_firewall_row_desc">Block connections to whole countries or networks (ASN).</string>
+    <string name="cn_intro">These come before every other rule: they apply to every app, including apps set to Bypass or Exclude. A connection to a blocked place is refused, and your own network (LAN) is never blocked.</string>
+    <string name="cn_countries_heading">Countries</string>
+    <string name="cn_mode_block">Block these countries</string>
+    <string name="cn_mode_allow">Allow only these</string>
+    <string name="cn_choose_countries">Choose countries</string>
+    <string name="cn_networks_heading">Networks (ASN)</string>
+    <string name="cn_networks_desc">Block everything a network (an autonomous system, such as a hosting company or an ISP) announces. AuroraVPN looks its address ranges up at RIPEstat and refreshes them weekly.</string>
+    <string name="cn_block_network">Block a network</string>
+    <string name="cn_no_countries">No countries yet.</string>
+    <string name="cn_no_networks">No networks yet.</string>
+    <string name="cn_blocked">blocked</string>
+    <string name="cn_allowed">allowed</string>
+    <string name="cn_remove">Remove</string>
+    <string name="cn_network_sub">Network blocked</string>
+    <string name="cn_block_network_hint" translatable="false">13335 or AS13335</string>
+    <string name="cn_block_network_msg">Enter the network\'s AS number. For example, AS13335 is Cloudflare and AS16509 is Amazon AWS.</string>
+    <string name="cn_bad_asn">Enter a network number like 13335 or AS13335</string>
+    <string name="cn_country_title" translatable="false">%1$s  %2$s</string>
+    <string name="cn_country_sub" translatable="false">%1$s · %2$s</string>
 
     <string name="firewall_rule_no_rule_desc" translatable="true">No firewall rules matched this connection.</string>
     <string name="firewall_rule_block_app_desc" translatable="true"><![CDATA[A user-set firewall rule blocked this <i>app</i>.<br/><br/> To change go to <i>All Apps</i> tab.]]></string>

@@ -1129,6 +1129,15 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
 
             logd("firewall($connId): $connInfo")
             val uid = connInfo.uid
+
+            // Countries & networks: a destination in a blocked country or network
+            // (ASN) is refused before every other rule and for every app. The LAN
+            // is never blocked (a private address resolves to no country/network).
+            geoBlocked(connInfo.destIP)?.let {
+                logd("firewall($connId): geo blocked ($it), $uid, ${connInfo.destIP}")
+                return it
+            }
+
             val appStatus = FirewallManager.appStatus(uid)
             val connectionStatus = FirewallManager.connectionStatus(uid)
             val isTempAllowed = FirewallManager.isTempAllowed(uid)
@@ -1353,6 +1362,48 @@ class BraveVPNService : VpnService(), ConnectionMonitor.NetworkListener, Bridge,
 
         logd("no firewall rule($connId), uid=${connInfo.uid}")
         return FirewallRuleset.RULE0
+    }
+
+    // Countries & networks firewall: RULE20 if the destination IP is in a blocked
+    // country, RULE21 if it is in a blocked network (ASN), else null. The LAN is
+    // never blocked (a private address resolves to no country/network). Empty
+    // settings mean the feature is off, so an unused feature costs nothing.
+    private fun geoBlocked(destIp: String?): FirewallRuleset? {
+        if (destIp.isNullOrEmpty()) return null
+        val countries = persistentState.blockedCountries
+        val asns = persistentState.blockedAsns
+        if (countries.isEmpty() && asns.isEmpty()) return null
+        val inet = Utilities.normalizeIp(destIp) ?: return null
+        if (countries.isNotEmpty()) {
+            val cc = Utilities.getCountryCode(inet, this)
+            if (!cc.isNullOrEmpty() && countryBlocked(cc, countries)) {
+                return FirewallRuleset.RULE20
+            }
+        }
+        if (asns.isNotEmpty() && AsnRulesManager.isBlocked(inet)) {
+            return FirewallRuleset.RULE21
+        }
+        return null
+    }
+
+    private fun countryBlocked(cc: String, csv: String): Boolean {
+        val set = blockedCountrySet(csv)
+        if (set.isEmpty()) return false
+        val up = cc.uppercase()
+        return if (persistentState.blockedCountriesAllowlist) !set.contains(up) else set.contains(up)
+    }
+
+    // the blocked-country set, parsed once per distinct settings value: when the
+    // user edits the list the string changes and the set is rebuilt.
+    @Volatile private var ccCsvCache = ""
+    @Volatile private var ccSetCache: Set<String> = emptySet()
+
+    private fun blockedCountrySet(csv: String): Set<String> {
+        if (csv != ccCsvCache) {
+            ccSetCache = csv.split(",").map { it.trim().uppercase() }.filter { it.length == 2 }.toSet()
+            ccCsvCache = csv
+        }
+        return ccSetCache
     }
 
     private fun getDomainRule(domain: String?, uid: Int): Pair<DomainRulesManager.Status, String?> {

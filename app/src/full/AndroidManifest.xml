@@ -232,6 +232,10 @@
             android:name=".ui.activity.UniversalFirewallSettingsActivity"
             android:finishOnTaskLaunch="true" />
         <activity
+            android:name=".ui.activity.CountriesNetworksActivity"
+            android:label="@string/cn_title"
+            android:finishOnTaskLaunch="true" />
+        <activity
             android:name=".ui.activity.ConfigureOtherDnsActivity"
             android:finishOnTaskLaunch="true" />
         <activity

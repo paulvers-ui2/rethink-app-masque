@@ -22,6 +22,7 @@ import androidx.fragment.app.Fragment
 import by.kirich1409.viewbindingdelegate.viewBinding
 import com.arcadesignpro.auroravpn.R
 import com.arcadesignpro.auroravpn.databinding.FragmentFirewallSettingsBinding
+import com.arcadesignpro.auroravpn.ui.activity.CountriesNetworksActivity
 import com.arcadesignpro.auroravpn.ui.activity.CustomRulesActivity
 import com.arcadesignpro.auroravpn.ui.activity.UniversalFirewallSettingsActivity
 import com.arcadesignpro.auroravpn.util.Constants
@@ -47,6 +48,10 @@ class FirewallSettingsFragment : Fragment(R.layout.fragment_firewall_settings), 
         b.universalFirewallRl.setOnClickListener { openUniversalFirewallScreen() }
 
         b.appWiseIpDomainRl.setOnClickListener { openAppWiseIpScreen() }
+
+        b.countriesNetworksRl.setOnClickListener {
+            startActivity(Intent(requireContext(), CountriesNetworksActivity::class.java))
+        }
     }
 
     private fun openCustomIpScreen() {
