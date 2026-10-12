@@ -39,7 +39,6 @@ object RipeStatDownloader {
     private const val MAX_ASN = 4294967295L
 
     /** The CIDR prefixes announced by each ASN, as strings. */
-    @Suppress("TooGenericExceptionCaught")
     suspend fun fetchPrefixes(asns: List<Long>): List<String> = withContext(Dispatchers.IO) {
         if (asns.isEmpty()) return@withContext emptyList()
         val api =
@@ -51,21 +50,31 @@ object RipeStatDownloader {
                 .create(IRipeStatDownload::class.java)
         val out = mutableListOf<String>()
         for (asn in asns.take(MAX_ASNS)) {
-            try {
-                val resp = api.announcedPrefixes("AS$asn")
-                if (resp == null || !resp.isSuccessful) {
-                    Logger.w(LOG_TAG_DOWNLOAD, "ripestat: AS$asn failed: ${resp?.code()}")
-                    continue
-                }
-                val arr = resp.body()?.getAsJsonObject("data")?.getAsJsonArray("prefixes") ?: continue
-                arr.mapNotNullTo(out) { it.asJsonObject?.get("prefix")?.asString }
-            } catch (e: Exception) {
-                Logger.w(LOG_TAG_DOWNLOAD, "ripestat: AS$asn error: ${e.message}")
-            }
+            out += fetchOne(api, asn)
             if (out.size >= MAX_PREFIXES) break
         }
         Logger.i(LOG_TAG_DOWNLOAD, "ripestat: ${asns.size} ASN(s) -> ${out.size} prefixes")
         out.take(MAX_PREFIXES)
+    }
+
+    @Suppress("TooGenericExceptionCaught")
+    private suspend fun fetchOne(api: IRipeStatDownload, asn: Long): List<String> {
+        return try {
+            val resp = api.announcedPrefixes("AS$asn")
+            val arr =
+                resp?.takeIf { it.isSuccessful }?.body()
+                    ?.getAsJsonObject("data")
+                    ?.getAsJsonArray("prefixes")
+            if (arr == null) {
+                Logger.w(LOG_TAG_DOWNLOAD, "ripestat: AS$asn failed: ${resp?.code()}")
+                emptyList()
+            } else {
+                arr.mapNotNull { it.asJsonObject?.get("prefix")?.asString }
+            }
+        } catch (e: Exception) {
+            Logger.w(LOG_TAG_DOWNLOAD, "ripestat: AS$asn error: ${e.message}")
+            emptyList()
+        }
     }
 
     /** Fetch for the ASNs in [blockedAsnsCsv] and update the matcher and the cache. */
