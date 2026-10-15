@@ -44,6 +44,7 @@ import com.arcadesignpro.auroravpn.service.VpnController
 import com.arcadesignpro.auroravpn.util.Themes.Companion.getCurrentTheme
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.koin.android.ext.android.inject
@@ -168,7 +169,7 @@ class BubbleActivity : AppCompatActivity(R.layout.activity_bubble) {
                     }
                 ).flow.cachedIn(lifecycleScope)
 
-                allowedAppsPager.collect { pagingData ->
+                allowedAppsPager.collectLatest { pagingData ->
                     if (!isFinishing && !isDestroyed) {
                         allowedAdapter.submitData(pagingData)
                     }
@@ -212,7 +213,7 @@ class BubbleActivity : AppCompatActivity(R.layout.activity_bubble) {
                     }
                 ).flow.cachedIn(lifecycleScope)
 
-                blockedAppsPager.collect { pagingData ->
+                blockedAppsPager.collectLatest { pagingData ->
                     if (!isFinishing && !isDestroyed) {
                         blockedAdapter.submitData(pagingData)
                     }
