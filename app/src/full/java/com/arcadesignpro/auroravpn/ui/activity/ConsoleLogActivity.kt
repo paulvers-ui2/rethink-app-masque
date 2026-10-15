@@ -159,7 +159,10 @@ class ConsoleLogActivity : AppCompatActivity(R.layout.activity_console_log), and
             // disable all animations to prevent state inconsistencies
             b.consoleLogList.itemAnimator = null
 
-            // Set a custom layout manager that handles errors gracefully
+            // Last line of defence only: the list is fed by a single submitData (see
+            // observeLog), so these should not fire. If a layout or a scroll still
+            // hits a stale position, skip that pass instead of crashing the app; the
+            // next pass lays out the current data again.
             layoutManager = object : LinearLayoutManager(this@ConsoleLogActivity) {
                 override fun onLayoutChildren(recycler: RecyclerView.Recycler?, state: RecyclerView.State?) {
                     try {
@@ -168,6 +171,21 @@ class ConsoleLogActivity : AppCompatActivity(R.layout.activity_console_log), and
                         Logger.w(LOG_TAG_UI, "err(console) layout children: ${e.message}")
                     }
                 }
+
+                override fun scrollVerticallyBy(
+                    dy: Int,
+                    recycler: RecyclerView.Recycler?,
+                    state: RecyclerView.State?
+                ): Int {
+                    return try {
+                        super.scrollVerticallyBy(dy, recycler, state)
+                    } catch (e: IndexOutOfBoundsException) {
+                        Logger.w(LOG_TAG_UI, "err(console) scroll: ${e.message}")
+                        0
+                    }
+                }
+
+                override fun supportsPredictiveItemAnimations(): Boolean = false
             }
 
             b.consoleLogList.layoutManager = layoutManager
@@ -181,28 +199,13 @@ class ConsoleLogActivity : AppCompatActivity(R.layout.activity_console_log), and
     }
 
     private fun observeLog() {
+        // submitData(lifecycle, ...) cancels the previous PagingData before taking the
+        // new one. The suspending submitData launched per emission did not: with logs
+        // arriving all the time, two pagers fed the list at once and a scroll then hit
+        // a position that no longer existed (IndexOutOfBoundsException, "Inconsistency
+        // detected").
         viewModel.logs.observe(this) { pagingData ->
-            lifecycleScope.launch {
-                try {
-                    recyclerAdapter?.submitData(pagingData)
-                } catch (e: Exception) {
-                    Logger.e(LOG_TAG_UI, "err submitting data: ${e.message}")
-                    // Optionally recreate adapter if needed
-                    if (e is IndexOutOfBoundsException) {
-                        recreateAdapter()
-                    }
-                }
-            }
-        }
-    }
-
-    private fun recreateAdapter() {
-        try {
-            recyclerAdapter = ConsoleLogAdapter(this)
-            b.consoleLogList.adapter = recyclerAdapter
-            Logger.i(LOG_TAG_UI, "adapter recreated due to consistency error")
-        } catch (e: Exception) {
-            Logger.e(LOG_TAG_UI, "err; recreate adapter: ${e.message}")
+            recyclerAdapter?.submitData(lifecycle, pagingData)
         }
     }
 
@@ -227,9 +230,7 @@ class ConsoleLogActivity : AppCompatActivity(R.layout.activity_console_log), and
         }
 
         b.consoleLogDelete.setOnClickListener {
-            lifecycleScope.launch {
-                recyclerAdapter?.submitData(PagingData.empty())
-            }
+            recyclerAdapter?.submitData(lifecycle, PagingData.empty())
             io {
                 Logger.i(LOG_TAG_BUG_REPORT, "deleting all console logs")
                 consoleLogRepository.deleteAllLogs()
