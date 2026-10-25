@@ -159,6 +159,30 @@ jobs:
           echo "RELEASE_KEYSTORE_PATH=${RUNNER_TEMP}/release.keystore" >> "$GITHUB_ENV"
         shell: bash
 
+      - name: 🧪 Validate keystore and passwords
+        env:
+          KS_PASS: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          KEY_PASS: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: |
+          set -u
+          ks="$RELEASE_KEYSTORE_PATH"
+          if ! out=$(keytool -list -keystore "$ks" -storepass "$KS_PASS" 2>&1); then
+            echo "::error title=Keystore check failed::RELEASE_KEYSTORE_PASSWORD is wrong, or RELEASE_KEYSTORE_BASE64 is not a valid keystore. keytool said: $(echo "$out" | head -3 | tr '\n' ' ')"
+            exit 1
+          fi
+          aliases=$(echo "$out" | grep -E 'PrivateKeyEntry' | cut -d, -f1 | tr '\n' ' ')
+          if ! echo "$aliases" | tr ' ' '\n' | grep -qxF -- "$KEY_ALIAS"; then
+            echo "::error title=Alias mismatch::RELEASE_KEY_ALIAS does not match any key in the keystore. Aliases in the keystore: ${aliases:-none}"
+            exit 1
+          fi
+          if echo "$out" | grep -qi 'Keystore type: PKCS12' && [ "$KEY_PASS" != "$KS_PASS" ]; then
+            echo "::error title=Key password mismatch::The keystore is PKCS12, so RELEASE_KEY_PASSWORD must be exactly the same value as RELEASE_KEYSTORE_PASSWORD."
+            exit 1
+          fi
+          echo "Keystore OK: alias '$KEY_ALIAS' present, passwords consistent."
+        shell: bash
+
       - name: ⚙️ gradlew permissions
         run: chmod +x gradlew
 
@@ -168,10 +192,21 @@ jobs:
           RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
         run: |
-          set -eu
+          set -u
           tasks="assembleFdroidFullRelease"
           if [ "$INCLUDE_DEBUG" = true ]; then tasks="$tasks assembleFdroidFullDebug"; fi
-          ./gradlew $tasks -PfirestackRepo=local --no-configuration-cache --warning-mode all
+          log="$RUNNER_TEMP/gradle.log"
+          set +e
+          ./gradlew $tasks -PfirestackRepo=local --no-configuration-cache --warning-mode all 2>&1 | tee "$log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            # Surface the real reason as an annotation and in the job summary.
+            why=$({ grep -A12 -m1 'What went wrong' "$log"; grep -m8 -E '^e: |error: |FAILED' "$log"; } | cut -c1-300 | head -20)
+            echo "::error title=Gradle build failed::$(echo "$why" | tr '\n' '|' | cut -c1-1500)"
+            { echo '### Gradle failure'; echo '```'; echo "$why"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$rc"
         shell: bash
 
       - name: 🔎 Verify and name the APKs
