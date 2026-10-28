@@ -48,7 +48,14 @@ object ChainManager {
     // single-hop usque can never fight over the same port during testing.
     const val SOCKS_PORT = 40001
 
-    private const val BINARY_NAME = "libusque.so"
+    private const val SUBCOMMAND = "chain"
+    // A chain-capable libusque.so lists all of these in `chain --help`; a help that did
+    // not is not trusted to filter flags (see UsqueFlags.parseHelp).
+    private val CHAIN_CORE_FLAGS = listOf("bind", "port", "config", "wg", "exit-config")
+    private const val SECRETS_STDIN_NAME = "secrets-stdin"
+    // Starts with a flag left out each time the binary still refuses one (only when it
+    // could not be asked which flags it takes).
+    private const val MAX_FLAG_RETRIES = 3
     const val WARP1_CONFIG = "config.json"
     const val EXIT_CONFIG = "config_exit.json"
     const val WG_CONFIG = "wg0.conf"
@@ -179,10 +186,16 @@ object ChainManager {
     fun chainReady(ctx: Context): Boolean =
         warp1Registered(ctx) && warp2Registered(ctx) && wgLoaded(ctx)
 
-    private fun getBinary(ctx: Context): File {
-        val bin = File(ctx.applicationInfo.nativeLibraryDir, BINARY_NAME)
-        dlog(ctx, "getBinary: path=${bin.absolutePath} exists=${bin.exists()} canExec=${bin.canExecute()} size=${bin.length()}")
-        return bin
+    // The installed libusque.so if it is the one this build pinned (UsqueBinary.check), else
+    // null with the reason in [output], which lastStartError() shows.
+    private fun verifiedBinary(ctx: Context): File? {
+        val check = UsqueBinary.check(ctx)
+        dlog(ctx, "getBinary: ${check.describe()}")
+        if (check is UsqueBinary.Check.Ok) return check.file
+        output.clear()
+        output.add("error: ${check.reason()}")
+        Logger.e(Logger.LOG_TAG_PROXY, "chain: ${check.reason()}")
+        return null
     }
 
     // ── config readers / writers (UI editors use these) ───────────────────────
@@ -258,9 +271,7 @@ object ChainManager {
         // re-registration does not leave the hop without keys.
         val configFile = KeyVault.scratchFile(ctx, configName)
         try {
-            val bin = getBinary(ctx)
-            if (!bin.exists()) { dlog(ctx, "BINARY NOT FOUND in jniLibs/arm64-v8a/"); return@withContext false }
-            if (!bin.canExecute()) { dlog(ctx, "BINARY NOT EXECUTABLE — W^X?"); return@withContext false }
+            val bin = verifiedBinary(ctx) ?: return@withContext false
 
 
             val cmd = listOf(bin.absolutePath, "register", "--accept-tos", "-c", configFile.absolutePath)
@@ -306,7 +317,10 @@ object ChainManager {
 
     // A linear start/attach/verify sequence kept in one place so the log reads
     // top to bottom; mirrors UsqueManager.startSocksProxyLocked.
-    @Suppress("LongMethod", "CyclomaticComplexMethod", "CognitiveComplexMethod")
+    @Suppress(
+        "LongMethod", "CyclomaticComplexMethod", "CognitiveComplexMethod",
+        "LoopWithTooManyJumpStatements", "NestedBlockDepth",
+    )
     private fun startChainLocked(ctx: Context): Boolean {
         dlog(ctx, "startChain: >>>ENTRY<<<")
         val existing = process
@@ -332,10 +346,7 @@ object ChainManager {
         }
 
         return try {
-            val bin = getBinary(ctx)
-            if (!bin.exists() || !bin.canExecute()) {
-                dlog(ctx, "startChain: binary not ready"); return false
-            }
+            val bin = verifiedBinary(ctx) ?: return false
             // Fixed core + the per-hop flags from the chain screen (see ChainArgs).
             val ps = runCatching {
                 org.koin.java.KoinJavaComponent.get<PersistentState>(PersistentState::class.java)
@@ -348,15 +359,30 @@ object ChainManager {
                 return false
             }
             try {
+                // Which flags this libusque.so takes; null when it could not be asked.
+                val flags = UsqueBinary.flags(bin, SUBCOMMAND, CHAIN_CORE_FLAGS)
+                if (flags == null) dlog(ctx, "startChain: could not read `chain --help`, passing the flags unchecked")
+                if (flags != null && SECRETS_STDIN_NAME !in flags) legacyBinary = true
                 if (!legacyBinary) {
-                    val bundle = keyBundle(keys)
-                    val args = ChainArgs.build(ps) + SECRETS_STDIN_FLAG
-                    val started = try { spawnChain(ctx, bin, args, bundle) } finally { bundle.fill(0) }
-                    if (started || !output.rejectedAFlag()) return started
+                    val dropped = mutableListOf<String>()
+                    var refused: String? = null
+                    for (attempt in 1..MAX_FLAG_RETRIES) {
+                        val args = supported(ctx, UsqueOutput.without(ChainArgs.build(ps) + SECRETS_STDIN_FLAG, dropped), flags)
+                        val bundle = keyBundle(keys)
+                        val started = try { spawnChain(ctx, bin, args, bundle) } finally { bundle.fill(0) }
+                        refused = output.rejectedFlag()
+                        if (started || refused == null) return started
+                        if (refused == SECRETS_STDIN_FLAG) break
+                        // A flag the binary refused although it was not filtered out: leave it
+                        // out and start again, still with the keys on stdin.
+                        dropped += refused
+                        dlog(ctx, "startChain: libusque.so refused $refused (try $attempt) — starting again without it")
+                    }
+                    if (refused != SECRETS_STDIN_FLAG) return false
                     legacyBinary = true
-                    dlog(ctx, "startChain: libusque.so rejected a flag — retrying the old way")
+                    dlog(ctx, "startChain: libusque.so has no --secrets-stdin — retrying the old way")
                 }
-                startLegacy(ctx, bin, ps, keys)
+                startLegacy(ctx, bin, ps, keys, flags)
             } finally {
                 keys.values.forEach { it.fill(0) }
             }
@@ -417,14 +443,37 @@ object ChainManager {
      * private scratch files that are wiped as soon as usque has read them (it reads them
      * once, at start, before the SOCKS port opens).
      */
-    private fun startLegacy(ctx: Context, bin: File, ps: PersistentState?, keys: Map<String, ByteArray>): Boolean {
+    private fun startLegacy(
+        ctx: Context,
+        bin: File,
+        ps: PersistentState?,
+        keys: Map<String, ByteArray>,
+        flags: UsqueFlags?,
+    ): Boolean {
         val files = keys.mapValues { (name, data) -> KeyVault.scratchFile(ctx, name).also { it.writeBytes(data) } }
         return try {
-            val args = UsqueOutput.withoutNewerFlags(ChainArgs.buildWithFiles(ps, files.mapValues { it.value.absolutePath }))
+            val all = ChainArgs.buildWithFiles(ps, files.mapValues { it.value.absolutePath })
+            // Known flags: keep exactly what the binary takes. Unknown: the old guess.
+            val args = if (flags != null) supported(ctx, all, flags) else UsqueOutput.withoutNewerFlags(all)
             spawnChain(ctx, bin, args, null)
         } finally {
             files.values.forEach { KeyVault.wipe(it) }
         }
+    }
+
+    /**
+     * [args] without the flags this libusque.so does not take ([flags] null: unchanged). A
+     * left-out flag is logged: the app (or a hop edit) is newer than the binary.
+     */
+    private fun supported(ctx: Context, args: List<String>, flags: UsqueFlags?): List<String> {
+        if (flags == null) return args
+        val result = flags.supportedOnly(args)
+        if (result.dropped.isNotEmpty()) {
+            val msg = "this libusque.so does not take ${result.dropped.joinToString(" ")} — left out (update libusque.so)"
+            dlog(ctx, "startChain: $msg")
+            Logger.w(Logger.LOG_TAG_PROXY, "chain: $msg")
+        }
+        return result.kept
     }
 
     /** Spawns the chain with [args] and [stdin] (the key bundle, or nothing), then waits for its port. */
@@ -444,7 +493,7 @@ object ChainManager {
         // The chain brings up three tunnels in series (WARP1, then wg0, then
         // the HTTP/2 exit), so give the port longer to appear than the
         // single-hop path does.
-        val portReady = probePort(ctx, CHAIN_START_TIMEOUT_MS)
+        val portReady = probePort(ctx, CHAIN_START_TIMEOUT_MS, proc)
         val procAlive = proc.isAlive
         dlog(ctx, "startChain: proc.isAlive=$procAlive portReady=$portReady")
 
@@ -713,11 +762,17 @@ object ChainManager {
         return false
     }
 
-    private fun probePort(ctx: Context, timeoutMs: Long): Boolean {
+    // Gives up as soon as [proc] has exited: a refused flag ends usque in milliseconds, and
+    // waiting out the whole timeout for a dead process held every start up for 15s.
+    private fun probePort(ctx: Context, timeoutMs: Long, proc: Process): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         var attempt = 0
         while (System.currentTimeMillis() < deadline) {
             attempt++
+            if (!proc.isAlive) {
+                dlog(ctx, "probePort: process exited after $attempt attempts")
+                return false
+            }
             try {
                 java.net.Socket().use { s ->
                     s.connect(java.net.InetSocketAddress(SOCKS_HOST, SOCKS_PORT), PORT_CONNECT_TIMEOUT_MS)

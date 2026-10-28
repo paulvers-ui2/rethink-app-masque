@@ -7,8 +7,9 @@ import android.content.Context
  * settings. The command is a fixed core plus one editable flag string per hop:
  *
  *   core   chain -b 127.0.0.1 -p 40001 -c {config} --wg {wg} --exit-config {exit_config}
- *   WARP1  -s {sni} -m 1280 -i 1350 -P 443 -k 10s -r 1s --idle-timeout 25s --stall-timeout 2s
- *          --http2-fallback-after 2
+ *   WARP1  -s {sni} -m 1280 -i 1350 -P 443 -k 10s -r 1s --always-reconnect --idle-timeout 25s
+ *          --stall-timeout 2s --doh --dnssec validate --doh-url https://1.1.1.1/dns-query
+ *          --doh-url https://1.0.0.1/dns-query
  *   wg0    --wg-mtu 0 --wg-keepalive 25
  *   WARP2  --exit-sni {exit_sni} --exit-transport auto --exit-mtu 1280 --exit-connect-port 443
  *          --exit-stall-timeout 8s
@@ -38,14 +39,22 @@ object ChainArgs {
             "-c {config} --wg {wg} --exit-config {exit_config}"
 
     // WARP1 is the only hop on the host network (the ISP sees its SNI). QUIC with
-    // 1350-byte packets like simple WARP; after 2 failed QUIC connects in a row it
-    // switches to HTTP/2 over TCP 443 (mobile networks that drop UDP 443). -k / -r
-    // are the MASQUE keepalive and reconnect delay, shared with WARP2. WARP1 is
-    // rebuilt at once when the network changes (usque's default), or when packets
-    // go unanswered for 2s and a probe through it fails; QUIC drops a silent
-    // connection after 25s.
+    // 1350-byte packets like simple WARP. -k / -r are the MASQUE keepalive and
+    // reconnect delay, shared with WARP2. --always-reconnect keeps WARP1 and WARP2
+    // persistent: a lost hop is rebuilt at once, not when traffic next arrives
+    // (needs a libusque.so whose chain takes the flag; an older one has it left out,
+    // see UsqueFlags). WARP1 is also rebuilt when the network changes (usque's
+    // default), or when packets go unanswered for 2s and a probe through it fails;
+    // QUIC drops a silent connection after 25s.
+    //
+    // The proxied apps' names resolve over DNS-over-HTTPS to Cloudflare by IP with
+    // DNSSEC checked, same as simple WARP (UsqueManager.DEFAULT_SOCKS_DNS_ARGS).
+    //
+    // --http2-fallback-after is not set here: add it to this hop by hand when wanted
+    // (0 = never). Left out, usque's own default applies.
     const val DEFAULT_WARP1_ARGS =
-        "-s {sni} -m 1280 -i 1350 -P 443 -k 10s -r 1s --idle-timeout 25s --stall-timeout 2s --http2-fallback-after 2"
+        "-s {sni} -m 1280 -i 1350 -P 443 -k 10s -r 1s --always-reconnect --idle-timeout 25s --stall-timeout 2s " +
+            "--doh --dnssec validate --doh-url https://1.1.1.1/dns-query --doh-url https://1.0.0.1/dns-query"
 
     // --wg-mtu 0 = use wg0.conf's MTU; usque always caps it to what fits inside
     // WARP1 (WARP1 MTU - 60, or - 80 for an IPv6 endpoint).
