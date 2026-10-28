@@ -65,11 +65,15 @@ object UsqueBinary {
 
     fun check(ctx: Context): Check {
         val f = file(ctx)
-        if (!f.isFile) return Check.Missing(f)
-        if (!f.canExecute()) return Check.NotExecutable(f)
-        val actual = sha256(f) ?: return Check.Missing(f)
+        // Hashed only when there is an executable file; null also when it cannot be read.
+        val actual = if (f.isFile && f.canExecute()) sha256(f) else null
         val expected = BuildConfig.USQUE_SHA256.lowercase()
-        return if (expected.isEmpty() || expected == actual) Check.Ok(f, actual) else Check.Mismatch(f, expected, actual)
+        return when {
+            f.isFile && !f.canExecute() -> Check.NotExecutable(f)
+            actual == null -> Check.Missing(f)
+            expected.isEmpty() || expected == actual -> Check.Ok(f, actual)
+            else -> Check.Mismatch(f, expected, actual)
+        }
     }
 
     private fun identity(f: File) = "${f.absolutePath}|${f.length()}|${f.lastModified()}"
@@ -100,10 +104,8 @@ object UsqueBinary {
      */
     fun flags(bin: File, subcommand: String, mustHave: Collection<String>): UsqueFlags? {
         val key = "${identity(bin)}|$subcommand"
-        flagCache[key]?.let { return it }
-        val parsed = help(bin, subcommand)?.let { UsqueFlags.parseHelp(it, mustHave) } ?: return null
-        flagCache[key] = parsed
-        return parsed
+        return flagCache[key]
+            ?: help(bin, subcommand)?.let { UsqueFlags.parseHelp(it, mustHave) }?.also { flagCache[key] = it }
     }
 
     private fun help(bin: File, subcommand: String): String? = try {

@@ -246,9 +246,9 @@ object UsqueManager {
      * binary could not be asked.
      */
     private fun supported(ctx: Context, bin: File, args: List<String>): List<String> {
-        val sub = args.firstOrNull { !UsqueFlags.isFlag(it) } ?: return args
-        val flags = UsqueBinary.flags(bin, sub, SOCKS_CORE_FLAGS) ?: return args
-        val result = flags.supportedOnly(args)
+        val sub = args.firstOrNull { !UsqueFlags.isFlag(it) }
+        val flags = sub?.let { UsqueBinary.flags(bin, it, SOCKS_CORE_FLAGS) }
+        val result = flags?.supportedOnly(args) ?: return args
         if (result.dropped.isNotEmpty()) {
             val msg = "this libusque.so does not take ${result.dropped.joinToString(" ")} — left out (update libusque.so)"
             dlog(ctx, "startSocksProxy: $msg")
@@ -624,13 +624,10 @@ object UsqueManager {
     private fun probePort(ctx: Context, port: Int, timeoutMs: Long, proc: Process? = null): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         var attempt = 0
-        while (System.currentTimeMillis() < deadline) {
+        // A refused flag ends usque in milliseconds: stop waiting for its port then.
+        val exited = { proc != null && !proc.isAlive }
+        while (System.currentTimeMillis() < deadline && !exited()) {
             attempt++
-            // A refused flag ends usque in milliseconds: stop waiting for its port.
-            if (proc != null && !proc.isAlive) {
-                dlog(ctx, "probePort: port $port — process exited after $attempt attempts")
-                return false
-            }
             try {
                 java.net.Socket().use { s ->
                     s.connect(java.net.InetSocketAddress("127.0.0.1", port), 300)
@@ -640,7 +637,11 @@ object UsqueManager {
             } catch (_: Exception) {}
             Thread.sleep(200)
         }
-        dlog(ctx, "probePort: port $port NOT ready after ${timeoutMs}ms / ${attempt} attempts")
+        if (exited()) {
+            dlog(ctx, "probePort: port $port — process exited after $attempt attempts")
+        } else {
+            dlog(ctx, "probePort: port $port NOT ready after ${timeoutMs}ms / ${attempt} attempts")
+        }
         return false
     }
 
