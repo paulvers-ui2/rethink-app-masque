@@ -16,7 +16,8 @@ object UsqueManager {
     // networks this app targets, a Cloudflare SNI gets the tunnel throttled to a trickle
     // (handshakes pass, downloads stall) while google.com passes.
     const val DEFAULT_WARP_SNI = "google.com"
-    private const val BINARY_NAME = "libusque.so"
+    // A socks-capable libusque.so lists these in `<subcommand> --help` (see UsqueFlags.parseHelp).
+    private val SOCKS_CORE_FLAGS = listOf("bind", "port", "config")
     @Volatile private var process: Process? = null
     // Prevents concurrent startSocksProxy calls from killing each other (restart storm).
     private val startLock = kotlinx.coroutines.sync.Mutex()
@@ -227,11 +228,33 @@ object UsqueManager {
     // ... and is told so with "-c -".
     private const val KEYS_FROM_STDIN = "-"
 
-    private fun getBinary(ctx: Context): File {
-        val nativeDir = ctx.applicationInfo.nativeLibraryDir
-        val bin = File(nativeDir, BINARY_NAME)
-        dlog(ctx, "getBinary: path=${bin.absolutePath} exists=${bin.exists()} canExec=${bin.canExecute()} size=${bin.length()}")
-        return bin
+    // The installed libusque.so if it is the one this build pinned (UsqueBinary.check), else
+    // null with the reason in [output], which lastStartError() shows.
+    private fun verifiedBinary(ctx: Context): File? {
+        val check = UsqueBinary.check(ctx)
+        dlog(ctx, "getBinary: ${check.describe()}")
+        if (check is UsqueBinary.Check.Ok) return check.file
+        output.clear()
+        output.add("error: ${check.reason()}")
+        Logger.e(Logger.LOG_TAG_PROXY, "usque: ${check.reason()}")
+        return null
+    }
+
+    /**
+     * [args] (subcommand first) without the flags this libusque.so does not take, so an
+     * edit on the args screen it does not know cannot keep WARP down. Unchanged when the
+     * binary could not be asked.
+     */
+    private fun supported(ctx: Context, bin: File, args: List<String>): List<String> {
+        val sub = args.firstOrNull { !UsqueFlags.isFlag(it) } ?: return args
+        val flags = UsqueBinary.flags(bin, sub, SOCKS_CORE_FLAGS) ?: return args
+        val result = flags.supportedOnly(args)
+        if (result.dropped.isNotEmpty()) {
+            val msg = "this libusque.so does not take ${result.dropped.joinToString(" ")} — left out (update libusque.so)"
+            dlog(ctx, "startSocksProxy: $msg")
+            Logger.w(Logger.LOG_TAG_PROXY, "usque: $msg")
+        }
+        return result.kept
     }
 
     fun isRegistered(ctx: Context): Boolean = KeyVault.exists(ctx, CONFIG_NAME)
@@ -292,16 +315,7 @@ object UsqueManager {
         // re-registration (Cloudflare rate limit, no network) no longer leaves WARP without keys.
         val scratch = KeyVault.scratchFile(context, CONFIG_NAME)
         try {
-            val bin = getBinary(context)
-
-            if (!bin.exists()) {
-                dlog(context, "BINARY NOT FOUND — put libusque.so in jniLibs/arm64-v8a/")
-                return@withContext false
-            }
-            if (!bin.canExecute()) {
-                dlog(context, "BINARY NOT EXECUTABLE — W^X policy?")
-                return@withContext false
-            }
+            val bin = verifiedBinary(context) ?: return@withContext false
 
             // --accept-tos skips the stdin TOS prompt entirely
             val cmd = listOf(bin.absolutePath, "register", "--accept-tos", "-c", scratch.absolutePath)
@@ -442,11 +456,7 @@ object UsqueManager {
         portConfirmedAlive = false
 
         return try {
-            val bin = getBinary(ctx)
-            if (!bin.exists() || !bin.canExecute()) {
-                dlog(ctx, "startSocksProxy: binary not ready exists=${bin.exists()} canExec=${bin.canExecute()}")
-                return false
-            }
+            val bin = verifiedBinary(ctx) ?: return false
 
             val keys = KeyVault.read(ctx, CONFIG_NAME)
             if (keys == null) {
@@ -461,7 +471,7 @@ object UsqueManager {
                     // (Proxy settings > WARP > "libusque.so arguments"), it is used
                     // verbatim after {config}/{sni} substitution; otherwise fall back
                     // to the default template derived from warpSpoofedSni.
-                    val args = buildSocksArgs(ctx, KEYS_FROM_STDIN) + SECRETS_STDIN_FLAG
+                    val args = supported(ctx, bin, buildSocksArgs(ctx, KEYS_FROM_STDIN) + SECRETS_STDIN_FLAG)
                     val bundle = keyBundle(keys)
                     val started = try { spawnSocksProxy(ctx, bin, args, bundle) } finally { bundle.fill(0) }
                     if (started || !output.rejectedAFlag()) return started
@@ -520,7 +530,7 @@ object UsqueManager {
 
         // Wait for the port to actually be listening (up to 5s) instead of a blind sleep.
         // This prevents a race on slow devices where 1500ms wasn't enough.
-        val portReady = probePort(ctx, SOCKS_PORT, timeoutMs = 5000)
+        val portReady = probePort(ctx, SOCKS_PORT, timeoutMs = 5000, proc = proc)
         val procAlive = proc.isAlive
         dlog(ctx, "startSocksProxy: proc.isAlive=$procAlive portReady=$portReady")
 
@@ -611,11 +621,16 @@ object UsqueManager {
     }
 
     /** Poll 127.0.0.1:port until it accepts a connection or [timeoutMs] elapses. */
-    private fun probePort(ctx: Context, port: Int, timeoutMs: Long): Boolean {
+    private fun probePort(ctx: Context, port: Int, timeoutMs: Long, proc: Process? = null): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
         var attempt = 0
         while (System.currentTimeMillis() < deadline) {
             attempt++
+            // A refused flag ends usque in milliseconds: stop waiting for its port.
+            if (proc != null && !proc.isAlive) {
+                dlog(ctx, "probePort: port $port — process exited after $attempt attempts")
+                return false
+            }
             try {
                 java.net.Socket().use { s ->
                     s.connect(java.net.InetSocketAddress("127.0.0.1", port), 300)
