@@ -210,10 +210,35 @@ jobs:
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
           SIGNED: ${{ steps.signing.outputs.signed }}
         run: |
-          set -eu
-          tasks="assembleFdroidFullDebug"
-          if [ "$SIGNED" = true ]; then tasks="assembleFdroidFullRelease $tasks"; fi
-          ./gradlew $tasks -PfirestackRepo=local --no-configuration-cache --warning-mode all
+          set -u
+          log="$RUNNER_TEMP/gradle.log"
+          : > "$log"
+          # gradle.properties caps the Gradle/Kotlin heap at 2 GB, which runs out of
+          # memory compiling release and debug in one invocation ("Not enough memory
+          # to run compilation", GC overhead limit exceeded in
+          # compileFdroidFullDebugKotlin). Same fix as release-signed.yml: a bigger
+          # heap, and one variant per invocation with the daemon stopped in between.
+          run_gradle() {
+            ./gradlew "$@" -PfirestackRepo=local --no-configuration-cache --warning-mode all \
+              "-Dorg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8" \
+              "-Pkotlin.daemon.jvmargs=-Xmx3g" 2>&1 | tee -a "$log"
+            return "${PIPESTATUS[0]}"
+          }
+          rc=0
+          if [ "$SIGNED" = true ]; then
+            run_gradle assembleFdroidFullRelease || rc=$?
+            ./gradlew --stop > /dev/null 2>&1 || true
+          fi
+          if [ "$rc" -eq 0 ]; then
+            run_gradle assembleFdroidFullDebug || rc=$?
+          fi
+          if [ "$rc" -ne 0 ]; then
+            # Surface the real reason as an annotation and in the job summary.
+            why=$({ grep -A12 -m1 'What went wrong' "$log"; grep -m8 -E '^e: |error: |FAILED' "$log"; } | cut -c1-300 | head -20)
+            echo "::error title=Gradle build failed::$(echo "$why" | tr '\n' '|' | cut -c1-1500)"
+            { echo '### Gradle failure'; echo '```'; echo "$why"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit "$rc"
         shell: bash
 
       # app/build.gradle disables splits.abi and pins abiFilters to 'arm64-v8a',
