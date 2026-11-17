@@ -20,7 +20,7 @@
 
 ---
 
-This is a fork of [Rethink DNS + Firewall + VPN](https://github.com/celzero/rethink-app) with help of arcadesignpro, creatoreprints, diniboy1123, with these changes from the original:
+This is a fork of [Rethink DNS + Firewall + VPN](https://github.com/celzero/rethink-app) with help of diniboy1123, with these changes from the original:
 
 
 - **WARP over MASQUE**, using [usque](https://github.com/paulvers-ui/usque) instead of Cloudflare's official WireGuard client.
