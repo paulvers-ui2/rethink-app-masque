@@ -87,6 +87,7 @@ import com.paulvers.auroravpn.ui.activity.ProxySettingsActivity
 import com.paulvers.auroravpn.ui.activity.WgMainActivity
 import com.paulvers.auroravpn.ui.bottomsheet.HomeScreenSettingBottomSheet
 import com.paulvers.auroravpn.util.Constants
+import com.paulvers.auroravpn.util.Constants.Companion.CELZERO_FOUNDERS_DONATE_LINK
 import com.paulvers.auroravpn.util.Constants.Companion.RETHINKDNS_SPONSOR_LINK
 import com.paulvers.auroravpn.util.NotificationActionType
 import com.paulvers.auroravpn.util.UIUtils
@@ -419,6 +420,7 @@ class HomeScreenFragment : Fragment(R.layout.fragment_home_screen) {
         val amountTxt = dialogView.findViewById<AppCompatTextView>(R.id.dialog_sponsor_info_amount)
         val usageTxt = dialogView.findViewById<AppCompatTextView>(R.id.dialog_sponsor_info_usage)
         val sponsorBtn = dialogView.findViewById<AppCompatTextView>(R.id.dialog_sponsor_info_sponsor)
+        val foundersBtn = dialogView.findViewById<AppCompatTextView>(R.id.dialog_sponsor_info_founders)
 
         val dialog = alertBuilder.create()
 
@@ -426,6 +428,9 @@ class HomeScreenFragment : Fragment(R.layout.fragment_home_screen) {
         amountTxt.text = getString(R.string.two_argument_no_space, getString(R.string.symbol_dollar), "%.2f".format(amount))
         usageTxt.text = msg
 
+        foundersBtn.setOnClickListener {
+            openUrl(requireContext(), CELZERO_FOUNDERS_DONATE_LINK)
+        }
         sponsorBtn.setOnClickListener {
             openUrl(requireContext(), RETHINKDNS_SPONSOR_LINK)
         }

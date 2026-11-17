@@ -851,6 +851,7 @@
     <string name="about_privacy_policy" translatable="true">Read privacy policy</string>
     <string name="about_connect" translatable="true">contact</string>
     <string name="about_sponsor_link_text" translatable="true">Sponsor this fork</string>
+    <string name="about_celzero_founders_donate_text" translatable="true">Donate to the founders of the celzero project</string>
     <string name="about_app" translatable="true">app</string>
     <string name="about_email" translatable="true">Email us</string>
     <string name="about_settings" translatable="true">system</string>

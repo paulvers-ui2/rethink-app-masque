@@ -61,6 +61,7 @@ import com.paulvers.auroravpn.service.VpnController
 import com.paulvers.auroravpn.ui.HomeScreenActivity
 import com.paulvers.auroravpn.ui.bottomsheet.BugReportFilesBottomSheet
 import com.paulvers.auroravpn.util.Constants.Companion.INIT_TIME_MS
+import com.paulvers.auroravpn.util.Constants.Companion.CELZERO_FOUNDERS_DONATE_LINK
 import com.paulvers.auroravpn.util.Constants.Companion.RETHINKDNS_SPONSOR_LINK
 import com.paulvers.auroravpn.util.Constants.Companion.TIME_FORMAT_4
 import com.paulvers.auroravpn.util.FirebaseErrorReporting.TOKEN_LENGTH
@@ -147,6 +148,7 @@ class AboutFragment : Fragment(R.layout.fragment_about), View.OnClickListener, K
             b.aboutFlightRecord.visibility = View.GONE
         }
 
+        b.aboutCelzeroFoundersDonate.setOnClickListener(this)
         b.aboutSponsor.setOnClickListener(this)
         b.aboutWebsite.setOnClickListener(this)
         b.aboutTwitter.setOnClickListener(this)
@@ -342,6 +344,9 @@ class AboutFragment : Fragment(R.layout.fragment_about), View.OnClickListener, K
             }
             b.aboutWebsite -> {
                 openUrl(requireContext(), getString(R.string.about_website_link))
+            }
+            b.aboutCelzeroFoundersDonate -> {
+                openUrl(requireContext(), CELZERO_FOUNDERS_DONATE_LINK)
             }
             b.aboutSponsor -> {
                 openUrl(requireContext(), RETHINKDNS_SPONSOR_LINK)

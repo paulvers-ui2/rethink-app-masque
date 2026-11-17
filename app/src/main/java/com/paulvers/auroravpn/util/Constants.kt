@@ -138,6 +138,10 @@ class Constants {
         // sponsor link for this fork (upstream's was https://svc.rethinkdns.com/r/sponsor)
         const val RETHINKDNS_SPONSOR_LINK = "https://ko-fi.com/creatoreprints"
 
+        // donation link for the founders of the celzero project (upstream rethinkdns creators)
+        const val CELZERO_FOUNDERS_DONATE_LINK =
+            "https://donate.stripe.com/8wM7sUajiemkfK05kV?prefilled_email=anonymous.donor%40rethinkdns.com&locale=auto"
+
         // base-url for bravedns
         const val BRAVEDNS_DOMAIN = "bravedns.com"
 
